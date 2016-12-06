@@ -50,10 +50,21 @@ final class BitArray {
     this.bitCount = bitCount;
   }
 
+  private final class indexAndMask {
+    public final int index;
+    public final long mask;
+
+    public indexAndMask(long index) {
+      this.index = (int)(index >>> 6);
+      this.mask = 1L << (index & 0x3F);
+    }
+  }
+
   /** Returns true if the bit changed value. */
   boolean set(long index) {
-    if (!get(index)) {
-      data[(int) (index >>> 6)] |= (1L << index);
+    final indexAndMask iam = new indexAndMask(index);
+    if ((data[iam.index] & iam.mask) == 0) {
+      data[iam.index] |= iam.mask;
       bitCount++;
       return true;
     }
@@ -61,7 +72,8 @@ final class BitArray {
   }
 
   boolean get(long index) {
-    return (data[(int) (index >>> 6)] & (1L << index)) != 0;
+    final indexAndMask iam = new indexAndMask(index);
+    return (data[iam.index] & iam.mask) != 0;
   }
 
   /** Number of bits */
