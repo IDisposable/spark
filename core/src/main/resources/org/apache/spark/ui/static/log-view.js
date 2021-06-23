@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+/* global $ */
+
 var baseParams;
 
 var curLogLength;
@@ -51,13 +53,27 @@ function noNewAlert() {
   window.setTimeout(function () {alert.css("display", "none");}, 4000);
 }
 
+
+function getRESTEndPoint() {
+  // If the worker is served from the master through a proxy (see doc on spark.ui.reverseProxy), 
+  // we need to retain the leading ../proxy/<workerid>/ part of the URL when making REST requests.
+  // Similar logic is contained in executorspage.js function createRESTEndPoint.
+  var words = document.baseURI.split('/');
+  var ind = words.indexOf("proxy");
+  if (ind > 0) {
+    return words.slice(0, ind + 2).join('/') + "/log";
+  }
+  return "/log"
+}
+
+/* eslint-disable no-unused-vars */
 function loadMore() {
   var offset = Math.max(startByte - byteLength, 0);
   var moreByteLength = Math.min(byteLength, startByte);
 
   $.ajax({
     type: "GET",
-    url: "/log" + baseParams + "&offset=" + offset + "&byteLength=" + moreByteLength,
+    url: getRESTEndPoint() + baseParams + "&offset=" + offset + "&byteLength=" + moreByteLength,
     success: function (data) {
       var oldHeight = $(".log-content")[0].scrollHeight;
       var newlineIndex = data.indexOf('\n');
@@ -83,14 +99,14 @@ function loadMore() {
 function loadNew() {
   $.ajax({
     type: "GET",
-    url: "/log" + baseParams + "&byteLength=0",
+    url: getRESTEndPoint() + baseParams + "&byteLength=0",
     success: function (data) {
       var dataInfo = data.substring(0, data.indexOf('\n')).match(/\d+/g);
       var newDataLen = dataInfo[2] - totalLogLength;
       if (newDataLen != 0) {
         $.ajax({
           type: "GET",
-          url: "/log" + baseParams + "&byteLength=" + newDataLen,
+          url: getRESTEndPoint() + baseParams + "&byteLength=" + newDataLen,
           success: function (data) {
             var newlineIndex = data.indexOf('\n');
             var dataInfo = data.substring(0, newlineIndex).match(/\d+/g);
@@ -127,3 +143,4 @@ function initLogPage(params, logLen, start, end, totLogLen, defaultLen) {
     disableMoreButton();
   }
 }
+/* eslint-enable no-unused-vars */

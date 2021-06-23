@@ -19,24 +19,30 @@ package org.apache.spark.network.yarn;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Objects;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.metrics2.impl.MetricsSystemImpl;
+import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.server.api.*;
+import org.apache.spark.network.shuffle.MergedShuffleFileManager;
 import org.apache.spark.network.util.LevelDBProvider;
 import org.iq80.leveldb.DB;
 import org.iq80.leveldb.DBIterator;
@@ -45,11 +51,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.spark.network.TransportContext;
-import org.apache.spark.network.sasl.SaslServerBootstrap;
+import org.apache.spark.network.crypto.AuthServerBootstrap;
 import org.apache.spark.network.sasl.ShuffleSecretManager;
 import org.apache.spark.network.server.TransportServer;
 import org.apache.spark.network.server.TransportServerBootstrap;
-import org.apache.spark.network.shuffle.ExternalShuffleBlockHandler;
+import org.apache.spark.network.shuffle.ExternalBlockHandler;
 import org.apache.spark.network.util.TransportConf;
 import org.apache.spark.network.yarn.util.HadoopConfigProvider;
 
@@ -70,6 +76,20 @@ import org.apache.spark.network.yarn.util.HadoopConfigProvider;
  * is because an application running on the same Yarn cluster may choose to not use the external
  * shuffle service, in which case its setting of `spark.authenticate` should be independent of
  * the service's.
+ *
+ * The shuffle service will produce metrics via the YARN NodeManager's {@code metrics2} system
+ * under a namespace specified by the {@value SPARK_SHUFFLE_SERVICE_METRICS_NAMESPACE_KEY} config.
+ *
+ * By default, all configurations for the shuffle service will be taken directly from the
+ * Hadoop {@link Configuration} passed by the YARN NodeManager. It is also possible to configure
+ * the shuffle service by placing a resource named
+ * {@value SHUFFLE_SERVICE_CONF_OVERLAY_RESOURCE_NAME} into the classpath, which should be an
+ * XML file in the standard Hadoop Configuration resource format. Note that when the shuffle
+ * service is loaded in the default manner, without configuring
+ * {@code yarn.nodemanager.aux-services.<service>.classpath}, this file must be on the classpath
+ * of the NodeManager itself. When using the {@code classpath} configuration, it can be present
+ * either on the NodeManager's classpath, or specified in the classpath configuration.
+ * This {@code classpath} configuration is only supported on YARN versions >= 2.9.0.
  */
 public class YarnShuffleService extends AuxiliaryService {
   private static final Logger logger = LoggerFactory.getLogger(YarnShuffleService.class);
@@ -77,6 +97,14 @@ public class YarnShuffleService extends AuxiliaryService {
   // Port on which the shuffle server listens for fetch requests
   private static final String SPARK_SHUFFLE_SERVICE_PORT_KEY = "spark.shuffle.service.port";
   private static final int DEFAULT_SPARK_SHUFFLE_SERVICE_PORT = 7337;
+
+  /**
+   * The namespace to use for the metrics record which will contain all metrics produced by the
+   * shuffle service.
+   */
+  static final String SPARK_SHUFFLE_SERVICE_METRICS_NAMESPACE_KEY =
+      "spark.yarn.shuffle.service.metrics.namespace";
+  private static final String DEFAULT_SPARK_SHUFFLE_SERVICE_METRICS_NAME = "sparkShuffleService";
 
   // Whether the shuffle server should authenticate fetch requests
   private static final String SPARK_AUTHENTICATE_KEY = "spark.authenticate";
@@ -98,6 +126,13 @@ public class YarnShuffleService extends AuxiliaryService {
   private static final LevelDBProvider.StoreVersion CURRENT_VERSION = new LevelDBProvider
       .StoreVersion(1, 0);
 
+  /**
+   * The name of the resource to search for on the classpath to find a shuffle service-specific
+   * configuration overlay. If found, this will be parsed as a standard Hadoop
+   * {@link Configuration config} file and will override the configs passed from the NodeManager.
+   */
+  static final String SHUFFLE_SERVICE_CONF_OVERLAY_RESOURCE_NAME = "spark-shuffle-site.xml";
+
   // just for integration tests that want to look at this file -- in general not sensible as
   // a static
   @VisibleForTesting
@@ -111,6 +146,8 @@ public class YarnShuffleService extends AuxiliaryService {
   // The actual server that serves shuffle files
   private TransportServer shuffleServer = null;
 
+  private TransportContext transportContext = null;
+
   private Configuration _conf = null;
 
   // The recovery path used to shuffle service recovery
@@ -119,7 +156,7 @@ public class YarnShuffleService extends AuxiliaryService {
 
   // Handles registering executors and opening shuffle blocks
   @VisibleForTesting
-  ExternalShuffleBlockHandler blockHandler;
+  ExternalBlockHandler blockHandler;
 
   // Where to store & reload executor info for recovering state after an NM restart
   @VisibleForTesting
@@ -132,6 +169,13 @@ public class YarnShuffleService extends AuxiliaryService {
   private DB db;
 
   public YarnShuffleService() {
+    // The name of the auxiliary service configured within the NodeManager
+    // (`yarn.nodemanager.aux-services`) is treated as the source-of-truth, so this one can be
+    // arbitrary. The NodeManager will log a warning if the configured name doesn't match this name,
+    // to inform operators of a potential misconfiguration, but this name is otherwise not used.
+    // It is hard-coded instead of using the value of the `spark.shuffle.service.name` configuration
+    // because at this point in instantiation there is no Configuration object; it is not passed
+    // until `serviceInit` is called, at which point it's too late to adjust the name.
     super("spark_shuffle");
     logger.info("Initializing YARN shuffle service for Spark");
     instance = this;
@@ -150,10 +194,18 @@ public class YarnShuffleService extends AuxiliaryService {
    * Start the shuffle server with the given configuration.
    */
   @Override
-  protected void serviceInit(Configuration conf) throws Exception {
-    _conf = conf;
+  protected void serviceInit(Configuration externalConf) throws Exception {
+    _conf = new Configuration(externalConf);
+    URL confOverlayUrl = Thread.currentThread().getContextClassLoader()
+        .getResource(SHUFFLE_SERVICE_CONF_OVERLAY_RESOURCE_NAME);
+    if (confOverlayUrl != null) {
+      logger.info("Initializing Spark YARN shuffle service with configuration overlay from {}",
+          confOverlayUrl);
+      _conf.addResource(confOverlayUrl);
+    }
+    super.serviceInit(_conf);
 
-    boolean stopOnFailure = conf.getBoolean(STOP_ON_FAILURE_KEY, DEFAULT_STOP_ON_FAILURE);
+    boolean stopOnFailure = _conf.getBoolean(STOP_ON_FAILURE_KEY, DEFAULT_STOP_ON_FAILURE);
 
     try {
       // In case this NM was killed while there were running spark applications, we need to restore
@@ -161,28 +213,52 @@ public class YarnShuffleService extends AuxiliaryService {
       // If we don't find one, then we choose a file to use to save the state next time.  Even if
       // an application was stopped while the NM was down, we expect yarn to call stopApplication()
       // when it comes back
-      registeredExecutorFile = initRecoveryDb(RECOVERY_FILE_NAME);
+      if (_recoveryPath != null) {
+        registeredExecutorFile = initRecoveryDb(RECOVERY_FILE_NAME);
+      }
 
-      TransportConf transportConf = new TransportConf("shuffle", new HadoopConfigProvider(conf));
-      blockHandler = new ExternalShuffleBlockHandler(transportConf, registeredExecutorFile);
+      TransportConf transportConf = new TransportConf("shuffle", new HadoopConfigProvider(_conf));
+      MergedShuffleFileManager shuffleMergeManager = newMergedShuffleFileManagerInstance(
+        transportConf);
+      blockHandler = new ExternalBlockHandler(
+        transportConf, registeredExecutorFile, shuffleMergeManager);
 
       // If authentication is enabled, set up the shuffle server to use a
       // special RPC handler that filters out unauthenticated fetch requests
       List<TransportServerBootstrap> bootstraps = Lists.newArrayList();
-      boolean authEnabled = conf.getBoolean(SPARK_AUTHENTICATE_KEY, DEFAULT_SPARK_AUTHENTICATE);
+      boolean authEnabled = _conf.getBoolean(SPARK_AUTHENTICATE_KEY, DEFAULT_SPARK_AUTHENTICATE);
       if (authEnabled) {
-        createSecretManager();
-        bootstraps.add(new SaslServerBootstrap(transportConf, secretManager));
+        secretManager = new ShuffleSecretManager();
+        if (_recoveryPath != null) {
+          loadSecretsFromDb();
+        }
+        bootstraps.add(new AuthServerBootstrap(transportConf, secretManager));
       }
 
-      int port = conf.getInt(
+      int port = _conf.getInt(
         SPARK_SHUFFLE_SERVICE_PORT_KEY, DEFAULT_SPARK_SHUFFLE_SERVICE_PORT);
-      TransportContext transportContext = new TransportContext(transportConf, blockHandler);
+      transportContext = new TransportContext(transportConf, blockHandler, true);
       shuffleServer = transportContext.createServer(port, bootstraps);
       // the port should normally be fixed, but for tests its useful to find an open port
       port = shuffleServer.getPort();
       boundPort = port;
       String authEnabledString = authEnabled ? "enabled" : "not enabled";
+
+      // register metrics on the block handler into the Node Manager's metrics system.
+      blockHandler.getAllMetrics().getMetrics().put("numRegisteredConnections",
+          shuffleServer.getRegisteredConnections());
+      blockHandler.getAllMetrics().getMetrics().putAll(shuffleServer.getAllMetrics().getMetrics());
+      String metricsNamespace = _conf.get(SPARK_SHUFFLE_SERVICE_METRICS_NAMESPACE_KEY,
+          DEFAULT_SPARK_SHUFFLE_SERVICE_METRICS_NAME);
+      YarnShuffleServiceMetrics serviceMetrics =
+          new YarnShuffleServiceMetrics(metricsNamespace, blockHandler.getAllMetrics());
+
+      MetricsSystemImpl metricsSystem = (MetricsSystemImpl) DefaultMetricsSystem.instance();
+      metricsSystem.register(
+          metricsNamespace, "Metrics on the Spark Shuffle Service", serviceMetrics);
+      logger.info("Registered metrics with Hadoop's DefaultMetricsSystem using namespace '{}'",
+          metricsNamespace);
+
       logger.info("Started YARN shuffle service for Spark on port {}. " +
         "Authentication is {}.  Registered executor file is {}", port, authEnabledString,
         registeredExecutorFile);
@@ -195,13 +271,29 @@ public class YarnShuffleService extends AuxiliaryService {
     }
   }
 
-  private void createSecretManager() throws IOException {
-    secretManager = new ShuffleSecretManager();
+  @VisibleForTesting
+  static MergedShuffleFileManager newMergedShuffleFileManagerInstance(TransportConf conf) {
+    String mergeManagerImplClassName = conf.mergedShuffleFileManagerImpl();
+    try {
+      Class<?> mergeManagerImplClazz = Class.forName(
+        mergeManagerImplClassName, true, Thread.currentThread().getContextClassLoader());
+      Class<? extends MergedShuffleFileManager> mergeManagerSubClazz =
+        mergeManagerImplClazz.asSubclass(MergedShuffleFileManager.class);
+      // The assumption is that all the custom implementations just like the RemoteBlockPushResolver
+      // will also need the transport configuration.
+      return mergeManagerSubClazz.getConstructor(TransportConf.class).newInstance(conf);
+    } catch (Exception e) {
+      logger.error("Unable to create an instance of {}", mergeManagerImplClassName);
+      return new ExternalBlockHandler.NoOpMergedShuffleFileManager(conf);
+    }
+  }
+
+  private void loadSecretsFromDb() throws IOException {
     secretsFile = initRecoveryDb(SECRETS_RECOVERY_FILE_NAME);
 
     // Make sure this is protected in case its not in the NM recovery dir
     FileSystem fs = FileSystem.getLocal(_conf);
-    fs.mkdirs(new Path(secretsFile.getPath()), new FsPermission((short)0700));
+    fs.mkdirs(new Path(secretsFile.getPath()), new FsPermission((short) 0700));
 
     db = LevelDBProvider.initLevelDB(secretsFile, CURRENT_VERSION, mapper);
     logger.info("Recovery location is: " + secretsFile.getPath());
@@ -244,7 +336,6 @@ public class YarnShuffleService extends AuxiliaryService {
     String appId = context.getApplicationId().toString();
     try {
       ByteBuffer shuffleSecret = context.getApplicationDataForService();
-      logger.info("Initializing application {}", appId);
       if (isAuthenticationEnabled()) {
         AppId fullId = new AppId(appId);
         if (db != null) {
@@ -263,7 +354,6 @@ public class YarnShuffleService extends AuxiliaryService {
   public void stopApplication(ApplicationTerminationContext context) {
     String appId = context.getApplicationId().toString();
     try {
-      logger.info("Stopping application {}", appId);
       if (isAuthenticationEnabled()) {
         AppId fullId = new AppId(appId);
         if (db != null) {
@@ -302,6 +392,9 @@ public class YarnShuffleService extends AuxiliaryService {
       if (shuffleServer != null) {
         shuffleServer.close();
       }
+      if (transportContext != null) {
+        transportContext.close();
+      }
       if (blockHandler != null) {
         blockHandler.close();
       }
@@ -320,10 +413,10 @@ public class YarnShuffleService extends AuxiliaryService {
   }
 
   /**
-   * Set the recovery path for shuffle service recovery when NM is restarted. The method will be
-   * overrode and called when Hadoop version is 2.5+ and NM recovery is enabled, otherwise we
-   * have to manually call this to set our own recovery path.
+   * Set the recovery path for shuffle service recovery when NM is restarted. This will be call
+   * by NM if NM recovery is enabled.
    */
+  @Override
   public void setRecoveryPath(Path recoveryPath) {
     _recoveryPath = recoveryPath;
   }
@@ -337,51 +430,46 @@ public class YarnShuffleService extends AuxiliaryService {
 
   /**
    * Figure out the recovery path and handle moving the DB if YARN NM recovery gets enabled
-   * when it previously was not. If YARN NM recovery is enabled it uses that path, otherwise
-   * it will uses a YARN local dir.
+   * and DB exists in the local dir of NM by old version of shuffle service.
    */
-  protected File initRecoveryDb(String dbFileName) {
-    if (_recoveryPath != null) {
-        File recoveryFile = new File(_recoveryPath.toUri().getPath(), dbFileName);
-        if (recoveryFile.exists()) {
-          return recoveryFile;
-        }
+  protected File initRecoveryDb(String dbName) {
+    Preconditions.checkNotNull(_recoveryPath,
+      "recovery path should not be null if NM recovery is enabled");
+
+    File recoveryFile = new File(_recoveryPath.toUri().getPath(), dbName);
+    if (recoveryFile.exists()) {
+      return recoveryFile;
     }
+
     // db doesn't exist in recovery path go check local dirs for it
     String[] localDirs = _conf.getTrimmedStrings("yarn.nodemanager.local-dirs");
     for (String dir : localDirs) {
-      File f = new File(new Path(dir).toUri().getPath(), dbFileName);
+      File f = new File(new Path(dir).toUri().getPath(), dbName);
       if (f.exists()) {
-        if (_recoveryPath == null) {
-          // If NM recovery is not enabled, we should specify the recovery path using NM local
-          // dirs, which is compatible with the old code.
-          _recoveryPath = new Path(dir);
-          return f;
-        } else {
-          // If the recovery path is set then either NM recovery is enabled or another recovery
-          // DB has been initialized. If NM recovery is enabled and had set the recovery path
-          // make sure to move all DBs to the recovery path from the old NM local dirs.
-          // If another DB was initialized first just make sure all the DBs are in the same
-          // location.
-          File newLoc = new File(_recoveryPath.toUri().getPath(), dbFileName);
-          if (!newLoc.equals(f)) {
-            try {
-              Files.move(f.toPath(), newLoc.toPath());
-            } catch (Exception e) {
-              // Fail to move recovery file to new path, just continue on with new DB location
-              logger.error("Failed to move recovery file {} to the path {}",
-                dbFileName, _recoveryPath.toString(), e);
-            }
+        // If the recovery path is set then either NM recovery is enabled or another recovery
+        // DB has been initialized. If NM recovery is enabled and had set the recovery path
+        // make sure to move all DBs to the recovery path from the old NM local dirs.
+        // If another DB was initialized first just make sure all the DBs are in the same
+        // location.
+        Path newLoc = new Path(_recoveryPath, dbName);
+        Path copyFrom = new Path(f.toURI());
+        if (!newLoc.equals(copyFrom)) {
+          logger.info("Moving " + copyFrom + " to: " + newLoc);
+          try {
+            // The move here needs to handle moving non-empty directories across NFS mounts
+            FileSystem fs = FileSystem.getLocal(_conf);
+            fs.rename(copyFrom, newLoc);
+          } catch (Exception e) {
+            // Fail to move recovery file to new path, just continue on with new DB location
+            logger.error("Failed to move recovery file {} to the path {}",
+              dbName, _recoveryPath.toString(), e);
           }
-          return newLoc;
         }
+        return new File(newLoc.toUri().getPath());
       }
     }
-    if (_recoveryPath == null) {
-      _recoveryPath = new Path(localDirs[0]);
-    }
 
-    return new File(_recoveryPath.toUri().getPath(), dbFileName);
+    return new File(_recoveryPath.toUri().getPath(), dbName);
   }
 
   /**
@@ -401,7 +489,7 @@ public class YarnShuffleService extends AuxiliaryService {
       if (o == null || getClass() != o.getClass()) return false;
 
       AppId appExecId = (AppId) o;
-      return Objects.equal(appId, appExecId.appId);
+      return Objects.equals(appId, appExecId.appId);
     }
 
     @Override
@@ -411,8 +499,8 @@ public class YarnShuffleService extends AuxiliaryService {
 
     @Override
     public String toString() {
-      return Objects.toStringHelper(this)
-          .add("appId", appId)
+      return new ToStringBuilder(this, ToStringStyle.SHORT_PREFIX_STYLE)
+          .append("appId", appId)
           .toString();
     }
   }

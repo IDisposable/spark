@@ -17,6 +17,9 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
+import java.util.Locale
+
+import org.apache.parquet.hadoop.ParquetOutputFormat
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
@@ -25,24 +28,33 @@ import org.apache.spark.sql.internal.SQLConf
 /**
  * Options for the Parquet data source.
  */
-private[parquet] class ParquetOptions(
-    @transient private val parameters: CaseInsensitiveMap,
+class ParquetOptions(
+    @transient private val parameters: CaseInsensitiveMap[String],
     @transient private val sqlConf: SQLConf)
   extends Serializable {
 
   import ParquetOptions._
 
   def this(parameters: Map[String, String], sqlConf: SQLConf) =
-    this(new CaseInsensitiveMap(parameters), sqlConf)
+    this(CaseInsensitiveMap(parameters), sqlConf)
 
   /**
    * Compression codec to use. By default use the value specified in SQLConf.
    * Acceptable values are defined in [[shortParquetCompressionCodecNames]].
    */
   val compressionCodecClassName: String = {
-    val codecName = parameters.getOrElse("compression", sqlConf.parquetCompressionCodec).toLowerCase
+    // `compression`, `parquet.compression`(i.e., ParquetOutputFormat.COMPRESSION), and
+    // `spark.sql.parquet.compression.codec`
+    // are in order of precedence from highest to lowest.
+    val parquetCompressionConf = parameters.get(ParquetOutputFormat.COMPRESSION)
+    val codecName = parameters
+      .get("compression")
+      .orElse(parquetCompressionConf)
+      .getOrElse(sqlConf.parquetCompressionCodec)
+      .toLowerCase(Locale.ROOT)
     if (!shortParquetCompressionCodecNames.contains(codecName)) {
-      val availableCodecs = shortParquetCompressionCodecNames.keys.map(_.toLowerCase)
+      val availableCodecs =
+        shortParquetCompressionCodecNames.keys.map(_.toLowerCase(Locale.ROOT))
       throw new IllegalArgumentException(s"Codec [$codecName] " +
         s"is not available. Available codecs are ${availableCodecs.mkString(", ")}.")
     }
@@ -57,6 +69,19 @@ private[parquet] class ParquetOptions(
     .get(MERGE_SCHEMA)
     .map(_.toBoolean)
     .getOrElse(sqlConf.isParquetSchemaMergingEnabled)
+
+  /**
+   * The rebasing mode for the DATE and TIMESTAMP_MICROS, TIMESTAMP_MILLIS values in reads.
+   */
+  def datetimeRebaseModeInRead: String = parameters
+    .get(DATETIME_REBASE_MODE)
+    .getOrElse(sqlConf.getConf(SQLConf.PARQUET_REBASE_MODE_IN_READ))
+  /**
+   * The rebasing mode for INT96 timestamp values in reads.
+   */
+  def int96RebaseModeInRead: String = parameters
+    .get(INT96_REBASE_MODE)
+    .getOrElse(sqlConf.getConf(SQLConf.PARQUET_INT96_REBASE_MODE_IN_READ))
 }
 
 
@@ -69,5 +94,24 @@ object ParquetOptions {
     "uncompressed" -> CompressionCodecName.UNCOMPRESSED,
     "snappy" -> CompressionCodecName.SNAPPY,
     "gzip" -> CompressionCodecName.GZIP,
-    "lzo" -> CompressionCodecName.LZO)
+    "lzo" -> CompressionCodecName.LZO,
+    "lz4" -> CompressionCodecName.LZ4,
+    "brotli" -> CompressionCodecName.BROTLI,
+    "zstd" -> CompressionCodecName.ZSTD)
+
+  def getParquetCompressionCodecName(name: String): String = {
+    shortParquetCompressionCodecNames(name).name()
+  }
+
+  // The option controls rebasing of the DATE and TIMESTAMP values between
+  // Julian and Proleptic Gregorian calendars. It impacts on the behaviour of the Parquet
+  // datasource similarly to the SQL config `spark.sql.parquet.datetimeRebaseModeInRead`,
+  // and can be set to the same values: `EXCEPTION`, `LEGACY` or `CORRECTED`.
+  val DATETIME_REBASE_MODE = "datetimeRebaseMode"
+
+  // The option controls rebasing of the INT96 timestamp values between Julian and Proleptic
+  // Gregorian calendars. It impacts on the behaviour of the Parquet datasource similarly to
+  // the SQL config `spark.sql.parquet.int96RebaseModeInRead`.
+  // The valid option values are: `EXCEPTION`, `LEGACY` or `CORRECTED`.
+  val INT96_REBASE_MODE = "int96RebaseMode"
 }

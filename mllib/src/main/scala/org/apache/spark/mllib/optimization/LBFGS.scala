@@ -22,21 +22,18 @@ import scala.collection.mutable
 import breeze.linalg.{DenseVector => BDV}
 import breeze.optimize.{CachedDiffFunction, DiffFunction, LBFGS => BreezeLBFGS}
 
-import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.mllib.linalg.BLAS.axpy
 import org.apache.spark.rdd.RDD
 
 /**
- * :: DeveloperApi ::
  * Class used to solve an optimization problem using Limited-memory BFGS.
  * Reference: <a href="http://en.wikipedia.org/wiki/Limited-memory_BFGS">
  * Wikipedia on Limited-memory BFGS</a>
  * @param gradient Gradient function to be used.
  * @param updater Updater to be used to update weights after every iteration.
  */
-@DeveloperApi
 class LBFGS(private var gradient: Gradient, private var updater: Updater)
   extends Optimizer with Logging {
 
@@ -139,7 +136,14 @@ class LBFGS(private var gradient: Gradient, private var updater: Updater)
   }
 
   override def optimize(data: RDD[(Double, Vector)], initialWeights: Vector): Vector = {
-    val (weights, _) = LBFGS.runLBFGS(
+    val (weights, _) = optimizeWithLossReturned(data, initialWeights)
+    weights
+  }
+
+  def optimizeWithLossReturned(
+      data: RDD[(Double, Vector)],
+      initialWeights: Vector): (Vector, Array[Double]) = {
+    LBFGS.runLBFGS(
       data,
       gradient,
       updater,
@@ -148,16 +152,12 @@ class LBFGS(private var gradient: Gradient, private var updater: Updater)
       maxNumIterations,
       regParam,
       initialWeights)
-    weights
   }
-
 }
 
 /**
- * :: DeveloperApi ::
  * Top-level method to run L-BFGS.
  */
-@DeveloperApi
 object LBFGS extends Logging {
   /**
    * Run Limited-memory BFGS (L-BFGS) in parallel.
@@ -241,16 +241,24 @@ object LBFGS extends Logging {
       val bcW = data.context.broadcast(w)
       val localGradient = gradient
 
-      val (gradientSum, lossSum) = data.treeAggregate((Vectors.zeros(n), 0.0))(
-          seqOp = (c, v) => (c, v) match { case ((grad, loss), (label, features)) =>
-            val l = localGradient.compute(
-              features, label, bcW.value, grad)
-            (grad, loss + l)
-          },
-          combOp = (c1, c2) => (c1, c2) match { case ((grad1, loss1), (grad2, loss2)) =>
-            axpy(1.0, grad2, grad1)
-            (grad1, loss1 + loss2)
-          })
+      val seqOp = (c: (Vector, Double), v: (Double, Vector)) =>
+        (c, v) match {
+          case ((grad, loss), (label, features)) =>
+            val denseGrad = grad.toDense
+            val l = localGradient.compute(features, label, bcW.value, denseGrad)
+            (denseGrad, loss + l)
+        }
+
+      val combOp = (c1: (Vector, Double), c2: (Vector, Double)) =>
+        (c1, c2) match { case ((grad1, loss1), (grad2, loss2)) =>
+          val denseGrad1 = grad1.toDense
+          val denseGrad2 = grad2.toDense
+          axpy(1.0, denseGrad2, denseGrad1)
+          (denseGrad1, loss1 + loss2)
+       }
+
+      val zeroSparseVector = Vectors.sparse(n, Seq.empty)
+      val (gradientSum, lossSum) = data.treeAggregate((zeroSparseVector, 0.0))(seqOp, combOp)
 
       // broadcasted model is not needed anymore
       bcW.destroy()

@@ -17,49 +17,103 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.catalog.SessionCatalog
+import scala.collection.mutable
+
+import org.apache.spark.sql.catalyst.CurrentUserContext.CURRENT_USER
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
 
 
 /**
- * Finds all [[RuntimeReplaceable]] expressions and replace them with the expressions that can
- * be evaluated. This is mainly used to provide compatibility with other databases.
- * For example, we use this to support "nvl" by replacing it with "coalesce".
+ * Finds all the expressions that are unevaluable and replace/rewrite them with semantically
+ * equivalent expressions that can be evaluated. Currently we replace two kinds of expressions:
+ * 1) [[RuntimeReplaceable]] expressions
+ * 2) [[UnevaluableAggregate]] expressions such as Every, Some, Any, CountIf
+ * This is mainly used to provide compatibility with other databases.
+ * Few examples are:
+ *   we use this to support "nvl" by replacing it with "coalesce".
+ *   we use this to replace Every and Any with Min and Max respectively.
+ *
+ * TODO: In future, explore an option to replace aggregate functions similar to
+ * how RuntimeReplaceable does.
  */
 object ReplaceExpressions extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsAnyPattern(RUNTIME_REPLACEABLE, COUNT_IF, BOOL_AGG)) {
     case e: RuntimeReplaceable => e.child
+    case CountIf(predicate) => Count(new NullIf(predicate, Literal.FalseLiteral))
+    case BoolOr(arg) => Max(arg)
+    case BoolAnd(arg) => Min(arg)
   }
 }
 
+/**
+ * Rewrite non correlated exists subquery to use ScalarSubquery
+ *   WHERE EXISTS (SELECT A FROM TABLE B WHERE COL1 > 10)
+ * will be rewritten to
+ *   WHERE (SELECT 1 FROM (SELECT A FROM TABLE B WHERE COL1 > 10) LIMIT 1) IS NOT NULL
+ */
+object RewriteNonCorrelatedExists extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsPattern(EXISTS_SUBQUERY)) {
+    case exists: Exists if exists.children.isEmpty =>
+      IsNotNull(
+        ScalarSubquery(
+          plan = Limit(Literal(1), Project(Seq(Alias(Literal(1), "col")()), exists.plan)),
+          exprId = exists.exprId))
+  }
+}
 
 /**
  * Computes the current date and time to make sure we return the same result in a single query.
  */
 object ComputeCurrentTime extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
-    val dateExpr = CurrentDate()
+    val currentDates = mutable.Map.empty[String, Literal]
     val timeExpr = CurrentTimestamp()
-    val currentDate = Literal.create(dateExpr.eval(EmptyRow), dateExpr.dataType)
-    val currentTime = Literal.create(timeExpr.eval(EmptyRow), timeExpr.dataType)
+    val timestamp = timeExpr.eval(EmptyRow).asInstanceOf[Long]
+    val currentTime = Literal.create(timestamp, timeExpr.dataType)
+    val timezone = Literal.create(conf.sessionLocalTimeZone, StringType)
 
-    plan transformAllExpressions {
-      case CurrentDate() => currentDate
-      case CurrentTimestamp() => currentTime
+    plan.transformAllExpressionsWithPruning(_.containsPattern(CURRENT_LIKE)) {
+      case currentDate @ CurrentDate(Some(timeZoneId)) =>
+        currentDates.getOrElseUpdate(timeZoneId, {
+          Literal.create(
+            DateTimeUtils.microsToDays(timestamp, currentDate.zoneId),
+            DateType)
+        })
+      case CurrentTimestamp() | Now() => currentTime
+      case CurrentTimeZone() => timezone
     }
   }
 }
 
 
-/** Replaces the expression of CurrentDatabase with the current database name. */
-case class GetCurrentDatabase(sessionCatalog: SessionCatalog) extends Rule[LogicalPlan] {
+/**
+ * Replaces the expression of CurrentDatabase with the current database name.
+ * Replaces the expression of CurrentCatalog with the current catalog name.
+ */
+case class ReplaceCurrentLike(catalogManager: CatalogManager) extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = {
-    plan transformAllExpressions {
+    import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
+    val currentNamespace = catalogManager.currentNamespace.quoted
+    val currentCatalog = catalogManager.currentCatalog.name()
+    val currentUser = Option(CURRENT_USER.get()).getOrElse(Utils.getCurrentUserName())
+
+    plan.transformAllExpressionsWithPruning(_.containsPattern(CURRENT_LIKE)) {
       case CurrentDatabase() =>
-        Literal.create(sessionCatalog.getCurrentDatabase, StringType)
+        Literal.create(currentNamespace, StringType)
+      case CurrentCatalog() =>
+        Literal.create(currentCatalog, StringType)
+      case CurrentUser() =>
+        Literal.create(currentUser, StringType)
     }
   }
 }

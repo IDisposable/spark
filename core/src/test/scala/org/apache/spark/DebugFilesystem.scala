@@ -20,9 +20,7 @@ package org.apache.spark
 import java.io.{FileDescriptor, InputStream}
 import java.lang
 import java.nio.ByteBuffer
-import java.util.concurrent.ConcurrentHashMap
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import org.apache.hadoop.fs._
@@ -31,27 +29,42 @@ import org.apache.spark.internal.Logging
 
 object DebugFilesystem extends Logging {
   // Stores the set of active streams and their creation sites.
-  private val openStreams = new ConcurrentHashMap[FSDataInputStream, Throwable]()
+  private val openStreams = mutable.Map.empty[FSDataInputStream, Throwable]
 
-  def clearOpenStreams(): Unit = {
+  def addOpenStream(stream: FSDataInputStream): Unit = openStreams.synchronized {
+    openStreams.put(stream, new Throwable())
+  }
+
+  def clearOpenStreams(): Unit = openStreams.synchronized {
     openStreams.clear()
   }
 
-  def assertNoOpenStreams(): Unit = {
-    val numOpen = openStreams.size()
+  def removeOpenStream(stream: FSDataInputStream): Unit = openStreams.synchronized {
+    openStreams.remove(stream)
+  }
+
+  def assertNoOpenStreams(): Unit = openStreams.synchronized {
+    val numOpen = openStreams.values.size
     if (numOpen > 0) {
-      for (exc <- openStreams.values().asScala) {
+      for (exc <- openStreams.values) {
         logWarning("Leaked filesystem connection created at:")
         exc.printStackTrace()
       }
-      throw new RuntimeException(s"There are $numOpen possibly leaked file streams.")
+      throw new IllegalStateException(s"There are $numOpen possibly leaked file streams.",
+        openStreams.values.head)
     }
   }
 }
 
 /**
- * DebugFilesystem wraps file open calls to track all open connections. This can be used in tests
- * to check that connections are not leaked.
+ * DebugFilesystem wraps
+ *     1) file open calls to track all open connections. This can be used in tests to check that
+ *        connections are not leaked;
+ *     2) rename calls to return false when destination's parent path does not exist. When
+ *        destination parent does not exist, LocalFileSystem uses FileUtil#copy to copy the
+ *        file and returns true if succeed, while many other hadoop file systems (e.g. HDFS, S3A)
+ *        return false without renaming any file. This helps to test that Spark can work with the
+ *        latter file systems.
  */
 // TODO(ekl) we should consider always interposing this to expose num open conns as a metric
 class DebugFilesystem extends LocalFileSystem {
@@ -59,8 +72,7 @@ class DebugFilesystem extends LocalFileSystem {
 
   override def open(f: Path, bufferSize: Int): FSDataInputStream = {
     val wrapped: FSDataInputStream = super.open(f, bufferSize)
-    openStreams.put(wrapped, new Throwable())
-
+    addOpenStream(wrapped)
     new FSDataInputStream(wrapped.getWrappedStream) {
       override def setDropBehind(dropBehind: lang.Boolean): Unit = wrapped.setDropBehind(dropBehind)
 
@@ -96,8 +108,11 @@ class DebugFilesystem extends LocalFileSystem {
       override def markSupported(): Boolean = wrapped.markSupported()
 
       override def close(): Unit = {
-        wrapped.close()
-        openStreams.remove(wrapped)
+        try {
+          wrapped.close()
+        } finally {
+          removeOpenStream(wrapped)
+        }
       }
 
       override def read(): Int = wrapped.read()
@@ -110,5 +125,9 @@ class DebugFilesystem extends LocalFileSystem {
 
       override def hashCode(): Int = wrapped.hashCode()
     }
+  }
+
+  override def rename(src: Path, dst: Path): Boolean = {
+    exists(dst.getParent) && super.rename(src, dst)
   }
 }

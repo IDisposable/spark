@@ -34,7 +34,7 @@ import java.io.OutputStream;
  *   <li>{@link String}</li>
  * </ul>
  * The false positive probability ({@code FPP}) of a Bloom filter is defined as the probability that
- * {@linkplain #mightContain(Object)} will erroneously return {@code true} for an object that hasu
+ * {@linkplain #mightContain(Object)} will erroneously return {@code true} for an object that has
  * not actually been put in the {@code BloomFilter}.
  *
  * The implementation is largely based on the {@code BloomFilter} class from Guava.
@@ -125,6 +125,16 @@ public abstract class BloomFilter {
    * @throws IncompatibleMergeException if {@code isCompatible(other) == false}
    */
   public abstract BloomFilter mergeInPlace(BloomFilter other) throws IncompatibleMergeException;
+
+  /**
+   * Combines this bloom filter with another bloom filter by performing a bitwise AND of the
+   * underlying data. The mutations happen to <b>this</b> instance. Callers must ensure the
+   * bloom filters are appropriately sized to avoid saturating them.
+   *
+   * @param other The bloom filter to combine this bloom filter with. It is not mutated.
+   * @throws IncompatibleMergeException if {@code isCompatible(other) == false}
+   */
+  public abstract BloomFilter intersectInPlace(BloomFilter other) throws IncompatibleMergeException;
 
   /**
    * Returns {@code true} if the element <i>might</i> have been put in this Bloom filter,

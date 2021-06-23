@@ -26,11 +26,14 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.netty.channel.Channel;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.spark.network.protocol.ChunkFetchFailure;
 import org.apache.spark.network.protocol.ChunkFetchSuccess;
+import org.apache.spark.network.protocol.MergedBlockMetaSuccess;
 import org.apache.spark.network.protocol.ResponseMessage;
 import org.apache.spark.network.protocol.RpcFailure;
 import org.apache.spark.network.protocol.RpcResponse;
@@ -54,9 +57,9 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
 
   private final Map<StreamChunkId, ChunkReceivedCallback> outstandingFetches;
 
-  private final Map<Long, RpcResponseCallback> outstandingRpcs;
+  private final Map<Long, BaseResponseCallback> outstandingRpcs;
 
-  private final Queue<StreamCallback> streamCallbacks;
+  private final Queue<Pair<String, StreamCallback>> streamCallbacks;
   private volatile boolean streamActive;
 
   /** Records the time (in system nanoseconds) that the last fetch or RPC request was sent. */
@@ -79,7 +82,7 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
     outstandingFetches.remove(streamChunkId);
   }
 
-  public void addRpcRequest(long requestId, RpcResponseCallback callback) {
+  public void addRpcRequest(long requestId, BaseResponseCallback callback) {
     updateTimeOfLastRequest();
     outstandingRpcs.put(requestId, callback);
   }
@@ -88,9 +91,9 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
     outstandingRpcs.remove(requestId);
   }
 
-  public void addStreamCallback(StreamCallback callback) {
-    timeOfLastRequestNs.set(System.nanoTime());
-    streamCallbacks.offer(callback);
+  public void addStreamCallback(String streamId, StreamCallback callback) {
+    updateTimeOfLastRequest();
+    streamCallbacks.offer(ImmutablePair.of(streamId, callback));
   }
 
   @VisibleForTesting
@@ -104,15 +107,31 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
    */
   private void failOutstandingRequests(Throwable cause) {
     for (Map.Entry<StreamChunkId, ChunkReceivedCallback> entry : outstandingFetches.entrySet()) {
-      entry.getValue().onFailure(entry.getKey().chunkIndex, cause);
+      try {
+        entry.getValue().onFailure(entry.getKey().chunkIndex, cause);
+      } catch (Exception e) {
+        logger.warn("ChunkReceivedCallback.onFailure throws exception", e);
+      }
     }
-    for (Map.Entry<Long, RpcResponseCallback> entry : outstandingRpcs.entrySet()) {
-      entry.getValue().onFailure(cause);
+    for (Map.Entry<Long, BaseResponseCallback> entry : outstandingRpcs.entrySet()) {
+      try {
+        entry.getValue().onFailure(cause);
+      } catch (Exception e) {
+        logger.warn("RpcResponseCallback.onFailure throws exception", e);
+      }
+    }
+    for (Pair<String, StreamCallback> entry : streamCallbacks) {
+      try {
+        entry.getValue().onFailure(entry.getKey(), cause);
+      } catch (Exception e) {
+        logger.warn("StreamCallback.onFailure throws exception", e);
+      }
     }
 
     // It's OK if new fetches appear, as they will fail immediately.
     outstandingFetches.clear();
     outstandingRpcs.clear();
+    streamCallbacks.clear();
   }
 
   @Override
@@ -166,10 +185,11 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
       }
     } else if (message instanceof RpcResponse) {
       RpcResponse resp = (RpcResponse) message;
-      RpcResponseCallback listener = outstandingRpcs.get(resp.requestId);
+      RpcResponseCallback listener = (RpcResponseCallback) outstandingRpcs.get(resp.requestId);
       if (listener == null) {
         logger.warn("Ignoring response for RPC {} from {} ({} bytes) since it is not outstanding",
           resp.requestId, getRemoteAddress(channel), resp.body().size());
+        resp.body().release();
       } else {
         outstandingRpcs.remove(resp.requestId);
         try {
@@ -180,7 +200,7 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
       }
     } else if (message instanceof RpcFailure) {
       RpcFailure resp = (RpcFailure) message;
-      RpcResponseCallback listener = outstandingRpcs.get(resp.requestId);
+      BaseResponseCallback listener = outstandingRpcs.get(resp.requestId);
       if (listener == null) {
         logger.warn("Ignoring response for RPC {} from {} ({}) since it is not outstanding",
           resp.requestId, getRemoteAddress(channel), resp.errorString);
@@ -188,13 +208,30 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
         outstandingRpcs.remove(resp.requestId);
         listener.onFailure(new RuntimeException(resp.errorString));
       }
+    } else if (message instanceof MergedBlockMetaSuccess) {
+      MergedBlockMetaSuccess resp = (MergedBlockMetaSuccess) message;
+      try {
+        MergedBlockMetaResponseCallback listener =
+          (MergedBlockMetaResponseCallback) outstandingRpcs.get(resp.requestId);
+        if (listener == null) {
+          logger.warn(
+            "Ignoring response for MergedBlockMetaRequest {} from {} ({} bytes) since it is not"
+              + " outstanding", resp.requestId, getRemoteAddress(channel), resp.body().size());
+        } else {
+          outstandingRpcs.remove(resp.requestId);
+          listener.onSuccess(resp.getNumChunks(), resp.body());
+        }
+      } finally {
+        resp.body().release();
+      }
     } else if (message instanceof StreamResponse) {
       StreamResponse resp = (StreamResponse) message;
-      StreamCallback callback = streamCallbacks.poll();
-      if (callback != null) {
+      Pair<String, StreamCallback> entry = streamCallbacks.poll();
+      if (entry != null) {
+        StreamCallback callback = entry.getValue();
         if (resp.byteCount > 0) {
-          StreamInterceptor interceptor = new StreamInterceptor(this, resp.streamId, resp.byteCount,
-            callback);
+          StreamInterceptor<ResponseMessage> interceptor = new StreamInterceptor<>(
+            this, resp.streamId, resp.byteCount, callback);
           try {
             TransportFrameDecoder frameDecoder = (TransportFrameDecoder)
               channel.pipeline().get(TransportFrameDecoder.HANDLER_NAME);
@@ -216,8 +253,9 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
       }
     } else if (message instanceof StreamFailure) {
       StreamFailure resp = (StreamFailure) message;
-      StreamCallback callback = streamCallbacks.poll();
-      if (callback != null) {
+      Pair<String, StreamCallback> entry = streamCallbacks.poll();
+      if (entry != null) {
+        StreamCallback callback = entry.getValue();
         try {
           callback.onFailure(resp.streamId, new RuntimeException(resp.error));
         } catch (IOException ioe) {

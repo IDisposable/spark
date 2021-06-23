@@ -17,17 +17,101 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import org.apache.hadoop.fs.Path
+import scala.util.control.NonFatal
 
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+
+import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.io.FileCommitProtocol
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.execution.datasources.{FileFormat, FileFormatWriter}
+import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.datasources.{BasicWriteJobStatsTracker, FileFormat, FileFormatWriter}
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.{SerializableConfiguration, Utils}
 
-object FileStreamSink {
+object FileStreamSink extends Logging {
   // The name of the subdirectory that is used to store metadata about which files are valid.
   val metadataDir = "_spark_metadata"
+
+  /**
+   * Returns true if there is a single path that has a metadata log indicating which files should
+   * be read.
+   */
+  def hasMetadata(path: Seq[String], hadoopConf: Configuration, sqlConf: SQLConf): Boolean = {
+    // User explicitly configs to ignore sink metadata.
+    if (sqlConf.fileStreamSinkMetadataIgnored) {
+      return false
+    }
+
+    path match {
+      case Seq(singlePath) =>
+        val hdfsPath = new Path(singlePath)
+        try {
+          val fs = hdfsPath.getFileSystem(hadoopConf)
+          if (fs.isDirectory(hdfsPath)) {
+            val metadataPath = getMetadataLogPath(fs, hdfsPath, sqlConf)
+            fs.exists(metadataPath)
+          } else {
+            false
+          }
+        } catch {
+          case e: SparkException => throw e
+          case NonFatal(e) =>
+            logWarning(s"Assume no metadata directory. Error while looking for " +
+              s"metadata directory in the path: $singlePath.", e)
+            false
+        }
+      case _ => false
+    }
+  }
+
+  def getMetadataLogPath(fs: FileSystem, path: Path, sqlConf: SQLConf): Path = {
+    val metadataDir = new Path(path, FileStreamSink.metadataDir)
+    FileStreamSink.checkEscapedMetadataPath(fs, metadataDir, sqlConf)
+    metadataDir
+  }
+
+  def checkEscapedMetadataPath(fs: FileSystem, metadataPath: Path, sqlConf: SQLConf): Unit = {
+    if (sqlConf.getConf(SQLConf.STREAMING_CHECKPOINT_ESCAPED_PATH_CHECK_ENABLED)
+        && StreamExecution.containsSpecialCharsInPath(metadataPath)) {
+      val legacyMetadataPath = new Path(metadataPath.toUri.toString)
+      val legacyMetadataPathExists =
+        try {
+          fs.exists(legacyMetadataPath)
+        } catch {
+          case NonFatal(e) =>
+            // We may not have access to this directory. Don't fail the query if that happens.
+            logWarning(e.getMessage, e)
+            false
+        }
+      if (legacyMetadataPathExists) {
+        throw QueryExecutionErrors.legacyMetadataPathExistsError(metadataPath, legacyMetadataPath)
+      }
+    }
+  }
+
+  /**
+   * Returns true if the path is the metadata dir or its ancestor is the metadata dir.
+   * E.g.:
+   *  - ancestorIsMetadataDirectory(/.../_spark_metadata) => true
+   *  - ancestorIsMetadataDirectory(/.../_spark_metadata/0) => true
+   *  - ancestorIsMetadataDirectory(/a/b/c) => false
+   */
+  def ancestorIsMetadataDirectory(path: Path, hadoopConf: Configuration): Boolean = {
+    val fs = path.getFileSystem(hadoopConf)
+    var currentPath = path.makeQualified(fs.getUri, fs.getWorkingDirectory)
+    while (currentPath != null) {
+      if (currentPath.getName == FileStreamSink.metadataDir) {
+        return true
+      } else {
+        currentPath = currentPath.getParent
+      }
+    }
+    return false
+  }
 }
 
 /**
@@ -44,21 +128,29 @@ class FileStreamSink(
     partitionColumnNames: Seq[String],
     options: Map[String, String]) extends Sink with Logging {
 
-  private val basePath = new Path(path)
-  private val logPath = new Path(basePath, FileStreamSink.metadataDir)
-  private val fileLog =
-    new FileStreamSinkLog(FileStreamSinkLog.VERSION, sparkSession, logPath.toUri.toString)
+  import FileStreamSink._
+
   private val hadoopConf = sparkSession.sessionState.newHadoopConf()
+  private val basePath = new Path(path)
+  private val logPath = getMetadataLogPath(basePath.getFileSystem(hadoopConf), basePath,
+    sparkSession.sessionState.conf)
+  private val retention = options.get("retention").map(Utils.timeStringAsMs)
+  private val fileLog = new FileStreamSinkLog(FileStreamSinkLog.VERSION, sparkSession,
+    logPath.toString, retention)
+
+  private def basicWriteJobStatsTracker: BasicWriteJobStatsTracker = {
+    val serializableHadoopConf = new SerializableConfiguration(hadoopConf)
+    new BasicWriteJobStatsTracker(serializableHadoopConf, BasicWriteJobStatsTracker.metrics)
+  }
 
   override def addBatch(batchId: Long, data: DataFrame): Unit = {
-    if (batchId <= fileLog.getLatest().map(_._1).getOrElse(-1L)) {
+    if (batchId <= fileLog.getLatestBatchId().getOrElse(-1L)) {
       logInfo(s"Skipping already committed batch $batchId")
     } else {
       val committer = FileCommitProtocol.instantiate(
         className = sparkSession.sessionState.conf.streamingFileCommitProtocolClass,
         jobId = batchId.toString,
-        outputPath = path,
-        isAppend = false)
+        outputPath = path)
 
       committer match {
         case manifestCommitter: ManifestFileCommitProtocol =>
@@ -71,20 +163,21 @@ class FileStreamSink(
       val partitionColumns: Seq[Attribute] = partitionColumnNames.map { col =>
         val nameEquality = data.sparkSession.sessionState.conf.resolver
         data.logicalPlan.output.find(f => nameEquality(f.name, col)).getOrElse {
-          throw new RuntimeException(s"Partition column $col not found in schema ${data.schema}")
+          throw QueryExecutionErrors.partitionColumnNotFoundInSchemaError(col, data.schema)
         }
       }
+      val qe = data.queryExecution
 
       FileFormatWriter.write(
         sparkSession = sparkSession,
-        queryExecution = data.queryExecution,
+        plan = qe.executedPlan,
         fileFormat = fileFormat,
         committer = committer,
-        outputSpec = FileFormatWriter.OutputSpec(path, Map.empty),
+        outputSpec = FileFormatWriter.OutputSpec(path, Map.empty, qe.analyzed.output),
         hadoopConf = hadoopConf,
         partitionColumns = partitionColumns,
         bucketSpec = None,
-        refreshFunction = _ => (),
+        statsTrackers = Seq(basicWriteJobStatsTracker),
         options = options)
     }
   }

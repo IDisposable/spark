@@ -17,18 +17,30 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import java.util.Locale
+
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogUtils}
-import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical.{Command, LogicalPlan}
-import org.apache.spark.sql.execution.command.RunnableCommand
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.execution.command.{DDLUtils, LeafRunnableCommand}
+import org.apache.spark.sql.execution.command.ViewHelper.createTemporaryViewRelation
+import org.apache.spark.sql.internal.StaticSQLConf
 import org.apache.spark.sql.types._
 
+/**
+ * Create a table and optionally insert some data into it. Note that this plan is unresolved and
+ * has to be replaced by the concrete implementations during analysis.
+ *
+ * @param tableDesc the metadata of the table to be created.
+ * @param mode the data writing mode
+ * @param query an optional logical plan representing data to write into the created table.
+ */
 case class CreateTable(
     tableDesc: CatalogTable,
     mode: SaveMode,
-    query: Option[LogicalPlan]) extends Command {
+    query: Option[LogicalPlan]) extends LogicalPlan {
   assert(tableDesc.provider.isDefined, "The table to be created must have a provider.")
 
   if (query.isEmpty) {
@@ -37,7 +49,13 @@ case class CreateTable(
       "create table without data insertion can only use ErrorIfExists or Ignore as SaveMode.")
   }
 
-  override def innerChildren: Seq[QueryPlan[_]] = query.toSeq
+  override def children: Seq[LogicalPlan] = query.toSeq
+  override def output: Seq[Attribute] = Seq.empty
+  override lazy val resolved: Boolean = false
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[LogicalPlan]): LogicalPlan =
+    copy(query = if (query.isDefined) Some(newChildren.head) else None)
 }
 
 /**
@@ -49,22 +67,27 @@ case class CreateTempViewUsing(
     replace: Boolean,
     global: Boolean,
     provider: String,
-    options: Map[String, String]) extends RunnableCommand {
+    options: Map[String, String]) extends LeafRunnableCommand {
 
   if (tableIdent.database.isDefined) {
     throw new AnalysisException(
       s"Temporary view '$tableIdent' should not have specified a database")
   }
 
-  override def argString: String = {
+  override def argString(maxFields: Int): String = {
     s"[tableIdent:$tableIdent " +
       userSpecifiedSchema.map(_ + " ").getOrElse("") +
       s"replace:$replace " +
       s"provider:$provider " +
-      CatalogUtils.maskCredentials(options)
+      conf.redactOptions(options)
   }
 
-  def run(sparkSession: SparkSession): Seq[Row] = {
+  override def run(sparkSession: SparkSession): Seq[Row] = {
+    if (provider.toLowerCase(Locale.ROOT) == DDLUtils.HIVE_PROVIDER) {
+      throw new AnalysisException("Hive data source can only be used with tables, " +
+        "you can't use it with CREATE TEMP VIEW USING")
+    }
+
     val dataSource = DataSource(
       sparkSession,
       userSpecifiedSchema = userSpecifiedSchema,
@@ -72,12 +95,30 @@ case class CreateTempViewUsing(
       options = options)
 
     val catalog = sparkSession.sessionState.catalog
-    val viewDefinition = Dataset.ofRows(
+    val analyzedPlan = Dataset.ofRows(
       sparkSession, LogicalRelation(dataSource.resolveRelation())).logicalPlan
 
     if (global) {
+      val db = sparkSession.sessionState.conf.getConf(StaticSQLConf.GLOBAL_TEMP_DATABASE)
+      val viewIdent = TableIdentifier(tableIdent.table, Option(db))
+      val viewDefinition = createTemporaryViewRelation(
+        viewIdent,
+        sparkSession,
+        replace,
+        catalog.getRawGlobalTempView,
+        originalText = None,
+        analyzedPlan,
+        aliasedPlan = analyzedPlan)
       catalog.createGlobalTempView(tableIdent.table, viewDefinition, replace)
     } else {
+      val viewDefinition = createTemporaryViewRelation(
+        tableIdent,
+        sparkSession,
+        replace,
+        catalog.getRawTempView,
+        originalText = None,
+        analyzedPlan,
+        aliasedPlan = analyzedPlan)
       catalog.createTempView(tableIdent.table, viewDefinition, replace)
     }
 
@@ -85,19 +126,8 @@ case class CreateTempViewUsing(
   }
 }
 
-case class RefreshTable(tableIdent: TableIdentifier)
-  extends RunnableCommand {
-
-  override def run(sparkSession: SparkSession): Seq[Row] = {
-    // Refresh the given table's metadata. If this table is cached as an InMemoryRelation,
-    // drop the original cached version and make the new version cached lazily.
-    sparkSession.catalog.refreshTable(tableIdent.quotedString)
-    Seq.empty[Row]
-  }
-}
-
 case class RefreshResource(path: String)
-  extends RunnableCommand {
+  extends LeafRunnableCommand {
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
     sparkSession.catalog.refreshByPath(path)

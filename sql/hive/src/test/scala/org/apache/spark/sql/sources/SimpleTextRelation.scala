@@ -21,9 +21,9 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce.{Job, TaskAttemptContext}
 
-import org.apache.spark.sql.{sources, Row, SparkSession}
+import org.apache.spark.sql.{sources, SparkSession}
 import org.apache.spark.sql.catalyst.{expressions, InternalRow}
-import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, InterpretedPredicate, InterpretedProjection, JoinedRow, Literal}
+import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, GenericInternalRow, InterpretedProjection, JoinedRow, Literal, Predicate}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.types.{DataType, StructType}
@@ -50,7 +50,7 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
           path: String,
           dataSchema: StructType,
           context: TaskAttemptContext): OutputWriter = {
-        new SimpleTextOutputWriter(path, context)
+        new SimpleTextOutputWriter(path, dataSchema, context)
       }
 
       override def getFileExtension(context: TaskAttemptContext): String = ""
@@ -88,7 +88,7 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
             val attribute = inputAttributes.find(_.name == column).get
             expressions.GreaterThan(attribute, literal)
         }.reduceOption(expressions.And).getOrElse(Literal(true))
-        InterpretedPredicate.create(filterCondition, inputAttributes)
+        Predicate.create(filterCondition, inputAttributes)
       }
 
       // Uses a simple projection to simulate column pruning
@@ -103,7 +103,7 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
               // `Cast`ed values are always of internal types (e.g. UTF8String instead of String)
               Cast(Literal(value), dataType).eval()
           })
-        }.filter(predicate).map(projection)
+        }.filter(predicate.eval).map(projection)
 
       // Appends partition values
       val fullOutput = requiredSchema.toAttributes ++ partitionSchema.toAttributes
@@ -117,13 +117,13 @@ class SimpleTextSource extends TextBasedFileFormat with DataSourceRegister {
   }
 }
 
-class SimpleTextOutputWriter(path: String, context: TaskAttemptContext)
+class SimpleTextOutputWriter(val path: String, dataSchema: StructType, context: TaskAttemptContext)
   extends OutputWriter {
 
   private val writer = CodecStreams.createOutputStreamWriter(context, new Path(path))
 
-  override def write(row: Row): Unit = {
-    val serialized = row.toSeq.map { v =>
+  override def write(row: InternalRow): Unit = {
+    val serialized = row.toSeq(dataSchema).map { v =>
       if (v == null) "" else v.toString
     }.mkString(",")
 

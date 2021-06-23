@@ -40,7 +40,7 @@ private[spark] object RpcEnv {
       conf: SparkConf,
       securityManager: SecurityManager,
       clientMode: Boolean = false): RpcEnv = {
-    create(name, host, host, port, conf, securityManager, clientMode)
+    create(name, host, host, port, conf, securityManager, 0, clientMode)
   }
 
   def create(
@@ -50,9 +50,10 @@ private[spark] object RpcEnv {
       port: Int,
       conf: SparkConf,
       securityManager: SecurityManager,
+      numUsableCores: Int,
       clientMode: Boolean): RpcEnv = {
     val config = RpcEnvConfig(conf, name, bindAddress, advertiseAddress, port, securityManager,
-      clientMode)
+      numUsableCores, clientMode)
     new NettyRpcEnvFactory().create(config)
   }
 }
@@ -146,11 +147,6 @@ private[spark] abstract class RpcEnv(conf: SparkConf) {
    * @param uri URI with location of the file.
    */
   def openChannel(uri: String): ReadableByteChannel
-
-  /**
-   * Return if the current thread is a RPC thread.
-   */
-  def isInRPCThread: Boolean
 }
 
 /**
@@ -191,7 +187,8 @@ private[spark] trait RpcEnvFileServer {
 
   /** Validates and normalizes the base URI for directories. */
   protected def validateDirectoryUri(baseUri: String): String = {
-    val fixedBaseUri = "/" + baseUri.stripPrefix("/").stripSuffix("/")
+    val baseCanonicalUri = new File(baseUri).getCanonicalPath
+    val fixedBaseUri = "/" + baseCanonicalUri.stripPrefix("/").stripSuffix("/")
     require(fixedBaseUri != "/files" && fixedBaseUri != "/jars",
       "Directory URI cannot be /files nor /jars.")
     fixedBaseUri
@@ -206,4 +203,5 @@ private[spark] case class RpcEnvConfig(
     advertiseAddress: String,
     port: Int,
     securityManager: SecurityManager,
+    numUsableCores: Int,
     clientMode: Boolean)

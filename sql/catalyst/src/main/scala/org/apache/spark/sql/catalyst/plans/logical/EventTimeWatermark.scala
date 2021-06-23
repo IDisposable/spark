@@ -17,13 +17,21 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
+import java.util.concurrent.TimeUnit
+
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.trees.TreePattern.{EVENT_TIME_WATERMARK, TreePattern}
+import org.apache.spark.sql.catalyst.util.IntervalUtils
 import org.apache.spark.sql.types.MetadataBuilder
 import org.apache.spark.unsafe.types.CalendarInterval
 
 object EventTimeWatermark {
   /** The [[org.apache.spark.sql.types.Metadata]] key used to hold the eventTime watermark delay. */
   val delayKey = "spark.watermarkDelayMs"
+
+  def getDelayMs(delay: CalendarInterval): Long = {
+    IntervalUtils.getDuration(delay, TimeUnit.MILLISECONDS)
+  }
 }
 
 /**
@@ -32,14 +40,24 @@ object EventTimeWatermark {
 case class EventTimeWatermark(
     eventTime: Attribute,
     delay: CalendarInterval,
-    child: LogicalPlan) extends LogicalPlan {
+    child: LogicalPlan) extends UnaryNode {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(EVENT_TIME_WATERMARK)
 
   // Update the metadata on the eventTime column to include the desired delay.
   override val output: Seq[Attribute] = child.output.map { a =>
     if (a semanticEquals eventTime) {
+      val delayMs = EventTimeWatermark.getDelayMs(delay)
       val updatedMetadata = new MetadataBuilder()
         .withMetadata(a.metadata)
-        .putLong(EventTimeWatermark.delayKey, delay.milliseconds)
+        .putLong(EventTimeWatermark.delayKey, delayMs)
+        .build()
+      a.withMetadata(updatedMetadata)
+    } else if (a.metadata.contains(EventTimeWatermark.delayKey)) {
+      // Remove existing watermark
+      val updatedMetadata = new MetadataBuilder()
+        .withMetadata(a.metadata)
+        .remove(EventTimeWatermark.delayKey)
         .build()
       a.withMetadata(updatedMetadata)
     } else {
@@ -47,5 +65,6 @@ case class EventTimeWatermark(
     }
   }
 
-  override val children: Seq[LogicalPlan] = child :: Nil
+  override protected def withNewChildInternal(newChild: LogicalPlan): EventTimeWatermark =
+    copy(child = newChild)
 }

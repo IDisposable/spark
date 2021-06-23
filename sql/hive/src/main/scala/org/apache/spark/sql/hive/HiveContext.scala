@@ -34,7 +34,7 @@ class HiveContext private[hive](_sparkSession: SparkSession)
   self =>
 
   def this(sc: SparkContext) = {
-    this(SparkSession.builder().sparkContext(HiveUtils.withHiveExternalCatalog(sc)).getOrCreate())
+    this(SparkSession.builder().enableHiveSupport().sparkContext(sc).getOrCreate())
   }
 
   def this(sc: JavaSparkContext) = this(sc.sc)
@@ -46,10 +46,6 @@ class HiveContext private[hive](_sparkSession: SparkSession)
    */
   override def newSession(): HiveContext = {
     new HiveContext(sparkSession.newSession())
-  }
-
-  protected[sql] override def sessionState: HiveSessionState = {
-    sparkSession.sessionState.asInstanceOf[HiveSessionState]
   }
 
   /**

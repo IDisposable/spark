@@ -21,7 +21,7 @@ import org.apache.spark.sql.{SparkSession, SQLContext}
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.execution.FileRelation
 import org.apache.spark.sql.sources.{BaseRelation, DataSourceRegister}
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructField, StructType}
 
 
 /**
@@ -40,6 +40,8 @@ import org.apache.spark.sql.types.StructType
 case class HadoopFsRelation(
     location: FileIndex,
     partitionSchema: StructType,
+    // The top-level columns in `dataSchema` should match the actual physical file schema, otherwise
+    // the ORC data source may not work with the by-ordinal mode.
     dataSchema: StructType,
     bucketSpec: Option[BucketSpec],
     fileFormat: FileFormat,
@@ -48,12 +50,12 @@ case class HadoopFsRelation(
 
   override def sqlContext: SQLContext = sparkSession.sqlContext
 
-  val schema: StructType = {
-    val dataSchemaColumnNames = dataSchema.map(_.name.toLowerCase).toSet
-    StructType(dataSchema ++ partitionSchema.filterNot { column =>
-      dataSchemaColumnNames.contains(column.name.toLowerCase)
-    })
-  }
+  // When data and partition schemas have overlapping columns, the output
+  // schema respects the order of the data schema for the overlapping columns, and it
+  // respects the data types of the partition schema.
+  val (schema: StructType, overlappedPartCols: Map[String, StructField]) =
+    PartitioningUtils.mergeDataAndPartitionSchema(dataSchema,
+      partitionSchema, sparkSession.sessionState.conf.caseSensitiveAnalysis)
 
   def partitionSchemaOption: Option[StructType] =
     if (partitionSchema.isEmpty) None else Some(partitionSchema)
@@ -65,7 +67,11 @@ case class HadoopFsRelation(
     }
   }
 
-  override def sizeInBytes: Long = location.sizeInBytes
+  override def sizeInBytes: Long = {
+    val compressionFactor = sqlContext.conf.fileCompressionFactor
+    (location.sizeInBytes * compressionFactor).toLong
+  }
+
 
   override def inputFiles: Array[String] = location.inputFiles
 }

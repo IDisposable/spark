@@ -22,6 +22,7 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, Da
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{ImperativeAggregate, TypedImperativeAggregate}
+import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.hive.execution.TestingTypedCount.State
 import org.apache.spark.sql.types._
 
@@ -32,28 +33,27 @@ case class TestingTypedCount(
     child: Expression,
     mutableAggBufferOffset: Int = 0,
     inputAggBufferOffset: Int = 0)
-  extends TypedImperativeAggregate[TestingTypedCount.State] {
+  extends TypedImperativeAggregate[TestingTypedCount.State]
+  with UnaryLike[Expression] {
 
   def this(child: Expression) = this(child, 0, 0)
-
-  override def children: Seq[Expression] = child :: Nil
 
   override def dataType: DataType = LongType
 
   override def nullable: Boolean = false
 
-  override val supportsPartial: Boolean = true
-
   override def createAggregationBuffer(): State = TestingTypedCount.State(0L)
 
-  override def update(buffer: State, input: InternalRow): Unit = {
+  override def update(buffer: State, input: InternalRow): State = {
     if (child.eval(input) != null) {
       buffer.count += 1
     }
+    buffer
   }
 
-  override def merge(buffer: State, input: State): Unit = {
+  override def merge(buffer: State, input: State): State = {
     buffer.count += input.count
+    buffer
   }
 
   override def eval(buffer: State): Any = buffer.count
@@ -78,6 +78,9 @@ case class TestingTypedCount(
     copy(inputAggBufferOffset = newInputAggBufferOffset)
 
   override val prettyName: String = "typed_count"
+
+  override protected def withNewChildInternal(newChild: Expression): TestingTypedCount =
+    copy(child = newChild)
 }
 
 object TestingTypedCount {

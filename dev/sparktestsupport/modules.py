@@ -17,6 +17,7 @@
 
 from functools import total_ordering
 import itertools
+import os
 import re
 
 all_modules = []
@@ -25,15 +26,16 @@ all_modules = []
 @total_ordering
 class Module(object):
     """
-    A module is the basic abstraction in our test runner script. Each module consists of a set of
-    source files, a set of test commands, and a set of dependencies on other modules. We use modules
-    to define a dependency graph that lets determine which tests to run based on which files have
-    changed.
+    A module is the basic abstraction in our test runner script. Each module consists of a set
+    of source files, a set of test commands, and a set of dependencies on other modules. We use
+    modules to define a dependency graph that let us determine which tests to run based on which
+    files have changed.
     """
 
-    def __init__(self, name, dependencies, source_file_regexes, build_profile_flags=(), environ={},
-                 sbt_test_goals=(), python_test_goals=(), blacklisted_python_implementations=(),
-                 test_tags=(), should_run_r_tests=False, should_run_build_tests=False):
+    def __init__(self, name, dependencies, source_file_regexes, build_profile_flags=(),
+                 environ=None, sbt_test_goals=(), python_test_goals=(),
+                 excluded_python_implementations=(), test_tags=(), should_run_r_tests=False,
+                 should_run_build_tests=False):
         """
         Define a new module.
 
@@ -49,7 +51,7 @@ class Module(object):
             module are changed.
         :param sbt_test_goals: A set of SBT test goals for testing this module.
         :param python_test_goals: A set of Python test goals for testing this module.
-        :param blacklisted_python_implementations: A set of Python implementations that are not
+        :param excluded_python_implementations: A set of Python implementations that are not
             supported by this module's Python components. The values in this set should match
             strings returned by Python's `platform.python_implementation()`.
         :param test_tags A set of tags that will be excluded when running unit tests if the module
@@ -62,9 +64,9 @@ class Module(object):
         self.source_file_prefixes = source_file_regexes
         self.sbt_test_goals = sbt_test_goals
         self.build_profile_flags = build_profile_flags
-        self.environ = environ
+        self.environ = environ or {}
         self.python_test_goals = python_test_goals
-        self.blacklisted_python_implementations = blacklisted_python_implementations
+        self.excluded_python_implementations = excluded_python_implementations
         self.test_tags = test_tags
         self.should_run_r_tests = should_run_r_tests
         self.should_run_build_tests = should_run_build_tests
@@ -100,9 +102,75 @@ tags = Module(
     ]
 )
 
+kvstore = Module(
+    name="kvstore",
+    dependencies=[tags],
+    source_file_regexes=[
+        "common/kvstore/",
+    ],
+    sbt_test_goals=[
+        "kvstore/test",
+    ],
+)
+
+network_common = Module(
+    name="network-common",
+    dependencies=[tags],
+    source_file_regexes=[
+        "common/network-common/",
+    ],
+    sbt_test_goals=[
+        "network-common/test",
+    ],
+)
+
+network_shuffle = Module(
+    name="network-shuffle",
+    dependencies=[tags],
+    source_file_regexes=[
+        "common/network-shuffle/",
+    ],
+    sbt_test_goals=[
+        "network-shuffle/test",
+    ],
+)
+
+unsafe = Module(
+    name="unsafe",
+    dependencies=[tags],
+    source_file_regexes=[
+        "common/unsafe",
+    ],
+    sbt_test_goals=[
+        "unsafe/test",
+    ],
+)
+
+launcher = Module(
+    name="launcher",
+    dependencies=[tags],
+    source_file_regexes=[
+        "launcher/",
+    ],
+    sbt_test_goals=[
+        "launcher/test",
+    ],
+)
+
+core = Module(
+    name="core",
+    dependencies=[kvstore, network_common, network_shuffle, unsafe, launcher],
+    source_file_regexes=[
+        "core/",
+    ],
+    sbt_test_goals=[
+        "core/test",
+    ],
+)
+
 catalyst = Module(
     name="catalyst",
-    dependencies=[tags],
+    dependencies=[tags, core],
     source_file_regexes=[
         "sql/catalyst/",
     ],
@@ -110,7 +178,6 @@ catalyst = Module(
         "catalyst/test",
     ],
 )
-
 
 sql = Module(
     name="sql",
@@ -141,6 +208,16 @@ hive = Module(
     ]
 )
 
+repl = Module(
+    name="repl",
+    dependencies=[hive],
+    source_file_regexes=[
+        "repl/",
+    ],
+    sbt_test_goals=[
+        "repl/test",
+    ],
+)
 
 hive_thriftserver = Module(
     name="hive-thriftserver",
@@ -157,6 +234,16 @@ hive_thriftserver = Module(
     ]
 )
 
+avro = Module(
+    name="avro",
+    dependencies=[sql],
+    source_file_regexes=[
+        "external/avro",
+    ],
+    sbt_test_goals=[
+        "avro/test",
+    ]
+)
 
 sql_kafka = Module(
     name="sql-kafka-0-10",
@@ -169,7 +256,6 @@ sql_kafka = Module(
     ]
 )
 
-
 sketch = Module(
     name="sketch",
     dependencies=[tags],
@@ -181,10 +267,9 @@ sketch = Module(
     ]
 )
 
-
 graphx = Module(
     name="graphx",
-    dependencies=[tags],
+    dependencies=[tags, core],
     source_file_regexes=[
         "graphx/",
     ],
@@ -193,10 +278,9 @@ graphx = Module(
     ]
 )
 
-
 streaming = Module(
     name="streaming",
-    dependencies=[tags],
+    dependencies=[tags, core],
     source_file_regexes=[
         "streaming",
     ],
@@ -212,7 +296,7 @@ streaming = Module(
 # fail other PRs.
 streaming_kinesis_asl = Module(
     name="streaming-kinesis-asl",
-    dependencies=[tags],
+    dependencies=[tags, core],
     source_file_regexes=[
         "external/kinesis-asl/",
         "external/kinesis-asl-assembly/",
@@ -229,66 +313,25 @@ streaming_kinesis_asl = Module(
 )
 
 
-streaming_kafka = Module(
-    name="streaming-kafka-0-8",
-    dependencies=[streaming],
-    source_file_regexes=[
-        "external/kafka-0-8",
-        "external/kafka-0-8-assembly",
-    ],
-    sbt_test_goals=[
-        "streaming-kafka-0-8/test",
-    ]
-)
-
 streaming_kafka_0_10 = Module(
     name="streaming-kafka-0-10",
-    dependencies=[streaming],
+    dependencies=[streaming, core],
     source_file_regexes=[
-        "external/kafka-0-10",
+        # The ending "/" is necessary otherwise it will include "sql-kafka" codes
+        "external/kafka-0-10/",
         "external/kafka-0-10-assembly",
+        "external/kafka-0-10-token-provider",
     ],
     sbt_test_goals=[
         "streaming-kafka-0-10/test",
-    ]
-)
-
-streaming_flume_sink = Module(
-    name="streaming-flume-sink",
-    dependencies=[streaming],
-    source_file_regexes=[
-        "external/flume-sink",
-    ],
-    sbt_test_goals=[
-        "streaming-flume-sink/test",
-    ]
-)
-
-
-streaming_flume = Module(
-    name="streaming-flume",
-    dependencies=[streaming],
-    source_file_regexes=[
-        "external/flume",
-    ],
-    sbt_test_goals=[
-        "streaming-flume/test",
-    ]
-)
-
-
-streaming_flume_assembly = Module(
-    name="streaming-flume-assembly",
-    dependencies=[streaming_flume, streaming_flume_sink],
-    source_file_regexes=[
-        "external/flume-assembly",
+        "token-provider-kafka-0-10/test"
     ]
 )
 
 
 mllib_local = Module(
     name="mllib-local",
-    dependencies=[tags],
+    dependencies=[tags, core],
     source_file_regexes=[
         "mllib-local",
     ],
@@ -322,14 +365,14 @@ examples = Module(
     ]
 )
 
-
 pyspark_core = Module(
     name="pyspark-core",
-    dependencies=[],
+    dependencies=[core],
     source_file_regexes=[
         "python/(?!pyspark/(ml|mllib|sql|streaming))"
     ],
     python_test_goals=[
+        # doctests
         "pyspark.rdd",
         "pyspark.context",
         "pyspark.conf",
@@ -338,18 +381,35 @@ pyspark_core = Module(
         "pyspark.serializers",
         "pyspark.profiler",
         "pyspark.shuffle",
-        "pyspark.tests",
+        "pyspark.util",
+        # unittests
+        "pyspark.tests.test_appsubmit",
+        "pyspark.tests.test_broadcast",
+        "pyspark.tests.test_conf",
+        "pyspark.tests.test_context",
+        "pyspark.tests.test_daemon",
+        "pyspark.tests.test_install_spark",
+        "pyspark.tests.test_join",
+        "pyspark.tests.test_profiler",
+        "pyspark.tests.test_rdd",
+        "pyspark.tests.test_rddbarrier",
+        "pyspark.tests.test_readwrite",
+        "pyspark.tests.test_serializers",
+        "pyspark.tests.test_shuffle",
+        "pyspark.tests.test_taskcontext",
+        "pyspark.tests.test_util",
+        "pyspark.tests.test_worker",
     ]
 )
 
-
 pyspark_sql = Module(
     name="pyspark-sql",
-    dependencies=[pyspark_core, hive],
+    dependencies=[pyspark_core, hive, avro],
     source_file_regexes=[
         "python/pyspark/sql"
     ],
     python_test_goals=[
+        # doctests
         "pyspark.sql.types",
         "pyspark.sql.context",
         "pyspark.sql.session",
@@ -361,8 +421,56 @@ pyspark_sql = Module(
         "pyspark.sql.functions",
         "pyspark.sql.readwriter",
         "pyspark.sql.streaming",
+        "pyspark.sql.udf",
         "pyspark.sql.window",
-        "pyspark.sql.tests",
+        "pyspark.sql.avro.functions",
+        "pyspark.sql.pandas.conversion",
+        "pyspark.sql.pandas.map_ops",
+        "pyspark.sql.pandas.group_ops",
+        "pyspark.sql.pandas.types",
+        "pyspark.sql.pandas.serializers",
+        "pyspark.sql.pandas.typehints",
+        "pyspark.sql.pandas.utils",
+        # unittests
+        "pyspark.sql.tests.test_arrow",
+        "pyspark.sql.tests.test_catalog",
+        "pyspark.sql.tests.test_column",
+        "pyspark.sql.tests.test_conf",
+        "pyspark.sql.tests.test_context",
+        "pyspark.sql.tests.test_dataframe",
+        "pyspark.sql.tests.test_datasources",
+        "pyspark.sql.tests.test_functions",
+        "pyspark.sql.tests.test_group",
+        "pyspark.sql.tests.test_pandas_cogrouped_map",
+        "pyspark.sql.tests.test_pandas_grouped_map",
+        "pyspark.sql.tests.test_pandas_map",
+        "pyspark.sql.tests.test_pandas_udf",
+        "pyspark.sql.tests.test_pandas_udf_grouped_agg",
+        "pyspark.sql.tests.test_pandas_udf_scalar",
+        "pyspark.sql.tests.test_pandas_udf_typehints",
+        "pyspark.sql.tests.test_pandas_udf_window",
+        "pyspark.sql.tests.test_readwriter",
+        "pyspark.sql.tests.test_serde",
+        "pyspark.sql.tests.test_session",
+        "pyspark.sql.tests.test_streaming",
+        "pyspark.sql.tests.test_types",
+        "pyspark.sql.tests.test_udf",
+        "pyspark.sql.tests.test_utils",
+    ]
+)
+
+
+pyspark_resource = Module(
+    name="pyspark-resource",
+    dependencies=[
+        pyspark_core
+    ],
+    source_file_regexes=[
+        "python/pyspark/resource"
+    ],
+    python_test_goals=[
+        # unittests
+        "pyspark.resource.tests.test_resources",
     ]
 )
 
@@ -372,16 +480,19 @@ pyspark_streaming = Module(
     dependencies=[
         pyspark_core,
         streaming,
-        streaming_kafka,
-        streaming_flume_assembly,
         streaming_kinesis_asl
     ],
     source_file_regexes=[
         "python/pyspark/streaming"
     ],
     python_test_goals=[
+        # doctests
         "pyspark.streaming.util",
-        "pyspark.streaming.tests",
+        # unittests
+        "pyspark.streaming.tests.test_context",
+        "pyspark.streaming.tests.test_dstream",
+        "pyspark.streaming.tests.test_kinesis",
+        "pyspark.streaming.tests.test_listener",
     ]
 )
 
@@ -393,6 +504,7 @@ pyspark_mllib = Module(
         "python/pyspark/mllib"
     ],
     python_test_goals=[
+        # doctests
         "pyspark.mllib.classification",
         "pyspark.mllib.clustering",
         "pyspark.mllib.evaluation",
@@ -407,9 +519,15 @@ pyspark_mllib = Module(
         "pyspark.mllib.stat.KernelDensity",
         "pyspark.mllib.tree",
         "pyspark.mllib.util",
-        "pyspark.mllib.tests",
+        # unittests
+        "pyspark.mllib.tests.test_algorithms",
+        "pyspark.mllib.tests.test_feature",
+        "pyspark.mllib.tests.test_linalg",
+        "pyspark.mllib.tests.test_stat",
+        "pyspark.mllib.tests.test_streaming_algorithms",
+        "pyspark.mllib.tests.test_util",
     ],
-    blacklisted_python_implementations=[
+    excluded_python_implementations=[
         "PyPy"  # Skip these tests under PyPy since they require numpy and it isn't available there
     ]
 )
@@ -422,18 +540,151 @@ pyspark_ml = Module(
         "python/pyspark/ml/"
     ],
     python_test_goals=[
-        "pyspark.ml.feature",
+        # doctests
         "pyspark.ml.classification",
         "pyspark.ml.clustering",
+        "pyspark.ml.evaluation",
+        "pyspark.ml.feature",
+        "pyspark.ml.fpm",
+        "pyspark.ml.functions",
+        "pyspark.ml.image",
         "pyspark.ml.linalg.__init__",
         "pyspark.ml.recommendation",
         "pyspark.ml.regression",
+        "pyspark.ml.stat",
         "pyspark.ml.tuning",
-        "pyspark.ml.tests",
-        "pyspark.ml.evaluation",
+        # unittests
+        "pyspark.ml.tests.test_algorithms",
+        "pyspark.ml.tests.test_base",
+        "pyspark.ml.tests.test_evaluation",
+        "pyspark.ml.tests.test_feature",
+        "pyspark.ml.tests.test_image",
+        "pyspark.ml.tests.test_linalg",
+        "pyspark.ml.tests.test_param",
+        "pyspark.ml.tests.test_persistence",
+        "pyspark.ml.tests.test_pipeline",
+        "pyspark.ml.tests.test_stat",
+        "pyspark.ml.tests.test_training_summary",
+        "pyspark.ml.tests.test_tuning",
+        "pyspark.ml.tests.test_util",
+        "pyspark.ml.tests.test_wrapper",
     ],
-    blacklisted_python_implementations=[
+    excluded_python_implementations=[
         "PyPy"  # Skip these tests under PyPy since they require numpy and it isn't available there
+    ]
+)
+
+pyspark_pandas = Module(
+    name="pyspark-pandas",
+    dependencies=[pyspark_core, pyspark_sql],
+    source_file_regexes=[
+        "python/pyspark/pandas/"
+    ],
+    python_test_goals=[
+        # doctests
+        "pyspark.pandas.accessors",
+        "pyspark.pandas.base",
+        "pyspark.pandas.categorical",
+        "pyspark.pandas.config",
+        "pyspark.pandas.datetimes",
+        "pyspark.pandas.exceptions",
+        "pyspark.pandas.extensions",
+        "pyspark.pandas.groupby",
+        "pyspark.pandas.indexing",
+        "pyspark.pandas.internal",
+        "pyspark.pandas.ml",
+        "pyspark.pandas.mlflow",
+        "pyspark.pandas.namespace",
+        "pyspark.pandas.numpy_compat",
+        "pyspark.pandas.sql_processor",
+        "pyspark.pandas.strings",
+        "pyspark.pandas.utils",
+        "pyspark.pandas.window",
+        "pyspark.pandas.indexes.base",
+        "pyspark.pandas.indexes.category",
+        "pyspark.pandas.indexes.datetimes",
+        "pyspark.pandas.indexes.multi",
+        "pyspark.pandas.indexes.numeric",
+        "pyspark.pandas.spark.accessors",
+        "pyspark.pandas.spark.utils",
+        "pyspark.pandas.typedef.typehints",
+        # unittests
+        "pyspark.pandas.tests.data_type_ops.test_base",
+        "pyspark.pandas.tests.data_type_ops.test_binary_ops",
+        "pyspark.pandas.tests.data_type_ops.test_boolean_ops",
+        "pyspark.pandas.tests.data_type_ops.test_categorical_ops",
+        "pyspark.pandas.tests.data_type_ops.test_complex_ops",
+        "pyspark.pandas.tests.data_type_ops.test_date_ops",
+        "pyspark.pandas.tests.data_type_ops.test_datetime_ops",
+        "pyspark.pandas.tests.data_type_ops.test_decimal_ops",
+        "pyspark.pandas.tests.data_type_ops.test_null_ops",
+        "pyspark.pandas.tests.data_type_ops.test_num_ops",
+        "pyspark.pandas.tests.data_type_ops.test_string_ops",
+        "pyspark.pandas.tests.data_type_ops.test_udt_ops",
+        "pyspark.pandas.tests.indexes.test_category",
+        "pyspark.pandas.tests.plot.test_frame_plot",
+        "pyspark.pandas.tests.plot.test_frame_plot_matplotlib",
+        "pyspark.pandas.tests.plot.test_frame_plot_plotly",
+        "pyspark.pandas.tests.plot.test_series_plot",
+        "pyspark.pandas.tests.plot.test_series_plot_matplotlib",
+        "pyspark.pandas.tests.plot.test_series_plot_plotly",
+        "pyspark.pandas.tests.test_categorical",
+        "pyspark.pandas.tests.test_config",
+        "pyspark.pandas.tests.test_csv",
+        "pyspark.pandas.tests.test_dataframe_conversion",
+        "pyspark.pandas.tests.test_dataframe_spark_io",
+        "pyspark.pandas.tests.test_default_index",
+        "pyspark.pandas.tests.test_expanding",
+        "pyspark.pandas.tests.test_extension",
+        "pyspark.pandas.tests.test_frame_spark",
+        "pyspark.pandas.tests.test_indexops_spark",
+        "pyspark.pandas.tests.test_internal",
+        "pyspark.pandas.tests.test_namespace",
+        "pyspark.pandas.tests.test_numpy_compat",
+        "pyspark.pandas.tests.test_ops_on_diff_frames_groupby_expanding",
+        "pyspark.pandas.tests.test_ops_on_diff_frames_groupby_rolling",
+        "pyspark.pandas.tests.test_repr",
+        "pyspark.pandas.tests.test_reshape",
+        "pyspark.pandas.tests.test_rolling",
+        "pyspark.pandas.tests.test_series_conversion",
+        "pyspark.pandas.tests.test_series_datetime",
+        "pyspark.pandas.tests.test_series_string",
+        "pyspark.pandas.tests.test_sql",
+        "pyspark.pandas.tests.test_typedef",
+        "pyspark.pandas.tests.test_utils",
+        "pyspark.pandas.tests.test_window",
+    ],
+    excluded_python_implementations=[
+        "PyPy"  # Skip these tests under PyPy since they require numpy, pandas, and pyarrow and
+                # they aren't available there
+    ]
+)
+
+pyspark_pandas_slow = Module(
+    name="pyspark-pandas-slow",
+    dependencies=[pyspark_core, pyspark_sql],
+    source_file_regexes=[
+        "python/pyspark/pandas/"
+    ],
+    python_test_goals=[
+        # doctests
+        "pyspark.pandas.frame",
+        "pyspark.pandas.generic",
+        "pyspark.pandas.series",
+        # unittests
+        "pyspark.pandas.tests.indexes.test_base",
+        "pyspark.pandas.tests.indexes.test_datetime",
+        "pyspark.pandas.tests.test_dataframe",
+        "pyspark.pandas.tests.test_groupby",
+        "pyspark.pandas.tests.test_indexing",
+        "pyspark.pandas.tests.test_ops_on_diff_frames",
+        "pyspark.pandas.tests.test_ops_on_diff_frames_groupby",
+        "pyspark.pandas.tests.test_series",
+        "pyspark.pandas.tests.test_stats",
+    ],
+    excluded_python_implementations=[
+        "PyPy"  # Skip these tests under PyPy since they require numpy, pandas, and pyarrow and
+        # they aren't available there
     ]
 )
 
@@ -469,7 +720,7 @@ yarn = Module(
     name="yarn",
     dependencies=[],
     source_file_regexes=[
-        "yarn/",
+        "resource-managers/yarn/",
         "common/network-yarn/",
     ],
     build_profile_flags=["-Pyarn"],
@@ -485,16 +736,55 @@ yarn = Module(
 mesos = Module(
     name="mesos",
     dependencies=[],
-    source_file_regexes=["mesos/"],
+    source_file_regexes=["resource-managers/mesos/"],
     build_profile_flags=["-Pmesos"],
     sbt_test_goals=["mesos/test"]
+)
+
+kubernetes = Module(
+    name="kubernetes",
+    dependencies=[],
+    source_file_regexes=["resource-managers/kubernetes"],
+    build_profile_flags=["-Pkubernetes"],
+    sbt_test_goals=["kubernetes/test"]
+)
+
+hadoop_cloud = Module(
+    name="hadoop-cloud",
+    dependencies=[],
+    source_file_regexes=["hadoop-cloud"],
+    build_profile_flags=["-Phadoop-cloud"],
+    sbt_test_goals=["hadoop-cloud/test"]
+)
+
+spark_ganglia_lgpl = Module(
+    name="spark-ganglia-lgpl",
+    dependencies=[],
+    build_profile_flags=["-Pspark-ganglia-lgpl"],
+    source_file_regexes=[
+        "external/spark-ganglia-lgpl",
+    ]
+)
+
+docker_integration_tests = Module(
+    name="docker-integration-tests",
+    dependencies=[],
+    build_profile_flags=["-Pdocker-integration-tests"],
+    source_file_regexes=["external/docker-integration-tests"],
+    sbt_test_goals=["docker-integration-tests/test"],
+    environ=None if "GITHUB_ACTIONS" not in os.environ else {
+        "ENABLE_DOCKER_INTEGRATION_TESTS": "1"
+    },
+    test_tags=[
+        "org.apache.spark.tags.DockerTest"
+    ]
 )
 
 # The root module is a dummy module which is used to run all of the tests.
 # No other modules should directly depend on this module.
 root = Module(
     name="root",
-    dependencies=[build],  # Changes to build should trigger all tests.
+    dependencies=[build, core],  # Changes to build should trigger all tests.
     source_file_regexes=[],
     # In order to run all of the tests, enable every test profile:
     build_profile_flags=list(set(

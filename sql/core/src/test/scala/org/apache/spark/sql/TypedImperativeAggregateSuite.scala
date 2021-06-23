@@ -23,13 +23,14 @@ import org.apache.spark.sql.TypedImperativeAggregateSuite.TypedMax
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, Expression, GenericInternalRow, ImplicitCastInputTypes, SpecificInternalRow}
 import org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate
+import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
-class TypedImperativeAggregateSuite extends QueryTest with SharedSQLContext {
+class TypedImperativeAggregateSuite extends QueryTest with SharedSparkSession {
 
   import testImplicits._
 
@@ -147,9 +148,9 @@ class TypedImperativeAggregateSuite extends QueryTest with SharedSQLContext {
     val query = df.select(typedMax($"key"), count($"key"), typedMax($"value"),
       count($"value"))
     val maxKey = nullableData.map(_._1).filter(_ != null).max
-    val countKey = nullableData.map(_._1).filter(_ != null).size
+    val countKey = nullableData.map(_._1).count(_ != null)
     val maxValue = nullableData.map(_._2).filter(_ != null).max
-    val countValue = nullableData.map(_._2).filter(_ != null).size
+    val countValue = nullableData.map(_._2).count(_ != null)
     val expected = Seq(Row(maxKey, countKey, maxValue, countValue))
     checkAnswer(query, expected)
   }
@@ -232,15 +233,15 @@ object TypedImperativeAggregateSuite {
       nullable: Boolean = false,
       mutableAggBufferOffset: Int = 0,
       inputAggBufferOffset: Int = 0)
-    extends TypedImperativeAggregate[MaxValue] with ImplicitCastInputTypes {
-
+    extends TypedImperativeAggregate[MaxValue] with ImplicitCastInputTypes
+    with UnaryLike[Expression] {
 
     override def createAggregationBuffer(): MaxValue = {
       // Returns Int.MinValue if all inputs are null
       new MaxValue(Int.MinValue)
     }
 
-    override def update(buffer: MaxValue, input: InternalRow): Unit = {
+    override def update(buffer: MaxValue, input: InternalRow): MaxValue = {
       child.eval(input) match {
         case inputValue: Int =>
           if (inputValue > buffer.value) {
@@ -249,13 +250,15 @@ object TypedImperativeAggregateSuite {
           }
         case null => // skip
       }
+      buffer
     }
 
-    override def merge(bufferMax: MaxValue, inputMax: MaxValue): Unit = {
+    override def merge(bufferMax: MaxValue, inputMax: MaxValue): MaxValue = {
       if (inputMax.value > bufferMax.value) {
         bufferMax.value = inputMax.value
         bufferMax.isValueSet = bufferMax.isValueSet || inputMax.isValueSet
       }
+      bufferMax
     }
 
     override def eval(bufferMax: MaxValue): Any = {
@@ -266,9 +269,7 @@ object TypedImperativeAggregateSuite {
       }
     }
 
-    override def deterministic: Boolean = true
-
-    override def children: Seq[Expression] = Seq(child)
+    override lazy val deterministic: Boolean = true
 
     override def inputTypes: Seq[AbstractDataType] = Seq(IntegerType)
 
@@ -295,6 +296,9 @@ object TypedImperativeAggregateSuite {
       val value = stream.readInt()
       new MaxValue(value, isValueSet)
     }
+
+    override protected def withNewChildInternal(newChild: Expression): TypedMax =
+      copy(child = newChild)
   }
 
   private class MaxValue(var value: Int, var isValueSet: Boolean = false)

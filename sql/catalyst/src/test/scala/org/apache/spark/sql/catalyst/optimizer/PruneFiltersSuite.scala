@@ -24,6 +24,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.internal.SQLConf
 
 class PruneFiltersSuite extends PlanTest {
 
@@ -31,10 +32,10 @@ class PruneFiltersSuite extends PlanTest {
     val batches =
       Batch("Subqueries", Once,
         EliminateSubqueryAliases) ::
-      Batch("Filter Pushdown and Pruning", Once,
+      Batch("Filter Pushdown and Pruning", FixedPoint(1),
         CombineFilters,
         PruneFilters,
-        PushDownPredicate,
+        PushPredicateThroughNonJoin,
         PushPredicateThroughJoin) :: Nil
   }
 
@@ -132,5 +133,45 @@ class PruneFiltersSuite extends PlanTest {
     val optimized = Optimize.execute(originalQuery)
     val correctAnswer = testRelation.where(Rand(10) > 5).where(Rand(10) > 5).select('a).analyze
     comparePlans(optimized, correctAnswer)
+  }
+
+  test("No pruning when constraint propagation is disabled") {
+    val tr1 = LocalRelation('a.int, 'b.int, 'c.int).subquery('tr1)
+    val tr2 = LocalRelation('a.int, 'd.int, 'e.int).subquery('tr2)
+
+    val query = tr1
+      .where("tr1.a".attr > 10 || "tr1.c".attr < 10)
+      .join(tr2.where('d.attr < 100), Inner, Some("tr1.a".attr === "tr2.a".attr))
+
+    val queryWithUselessFilter =
+      query.where(
+        ("tr1.a".attr > 10 || "tr1.c".attr < 10) &&
+          'd.attr < 100)
+
+    withSQLConf(SQLConf.CONSTRAINT_PROPAGATION_ENABLED.key -> "false") {
+      val optimized = Optimize.execute(queryWithUselessFilter.analyze)
+      // When constraint propagation is disabled, the useless filter won't be pruned.
+      // It gets pushed down. Because the rule `CombineFilters` runs only once, there are redundant
+      // and duplicate filters.
+      val correctAnswer = tr1
+        .where("tr1.a".attr > 10 || "tr1.c".attr < 10).where("tr1.a".attr > 10 || "tr1.c".attr < 10)
+        .join(tr2.where('d.attr < 100).where('d.attr < 100),
+          Inner, Some("tr1.a".attr === "tr2.a".attr)).analyze
+      comparePlans(optimized, correctAnswer)
+    }
+  }
+
+  test("SPARK-35273: CombineFilters support non-deterministic expressions") {
+    val x = testRelation.where(!'a.attr.in(1, 3, 5)).subquery('x)
+
+    comparePlans(
+      Optimize.execute(x.where('a.attr === 7 && Rand(10) > 0.1).analyze),
+      testRelation.where(!'a.attr.in(1, 3, 5) && 'a.attr === 7).where(Rand(10) > 0.1).analyze)
+
+    comparePlans(
+      Optimize.execute(
+        x.where('a.attr === 7 && Rand(10) > 0.1 && 'b.attr === 1 && Rand(10) < 1.1).analyze),
+      testRelation.where(!'a.attr.in(1, 3, 5) && 'a.attr === 7 && 'b.attr === 1)
+        .where(Rand(10) > 0.1 && Rand(10) < 1.1).analyze)
   }
 }

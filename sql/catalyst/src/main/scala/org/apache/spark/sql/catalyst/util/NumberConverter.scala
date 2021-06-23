@@ -22,26 +22,6 @@ import org.apache.spark.unsafe.types.UTF8String
 object NumberConverter {
 
   /**
-   * Divide x by m as if x is an unsigned 64-bit integer. Examples:
-   * unsignedLongDiv(-1, 2) == Long.MAX_VALUE unsignedLongDiv(6, 3) == 2
-   * unsignedLongDiv(0, 5) == 0
-   *
-   * @param x is treated as unsigned
-   * @param m is treated as signed
-   */
-  private def unsignedLongDiv(x: Long, m: Int): Long = {
-    if (x >= 0) {
-      x / m
-    } else {
-      // Let uval be the value of the unsigned long with the same bits as x
-      // Two's complement => x = uval - 2*MAX - 2
-      // => uval = x + 2*MAX + 2
-      // Now, use the fact: (a+b)/c = a/c + b/c + (a%c+b%c)/c
-      x / m + 2 * (Long.MaxValue / m) + 2 / m + (x % m + 2 * (Long.MaxValue % m) + 2 % m) / m
-    }
-  }
-
-  /**
    * Decode v into value[].
    *
    * @param v is treated as an unsigned 64-bit integer
@@ -52,7 +32,7 @@ object NumberConverter {
     java.util.Arrays.fill(value, 0.asInstanceOf[Byte])
     var i = value.length - 1
     while (tmpV != 0) {
-      val q = unsignedLongDiv(tmpV, radix)
+      val q = java.lang.Long.divideUnsigned(tmpV, radix)
       value(i) = (tmpV - q * radix).asInstanceOf[Byte]
       tmpV = q
       i -= 1
@@ -69,12 +49,12 @@ object NumberConverter {
    */
   private def encode(radix: Int, fromPos: Int, value: Array[Byte]): Long = {
     var v: Long = 0L
-    val bound = unsignedLongDiv(-1 - radix, radix) // Possible overflow once
+    val bound = java.lang.Long.divideUnsigned(-1 - radix, radix) // Possible overflow once
     var i = fromPos
     while (i < value.length && value(i) >= 0) {
       if (v >= bound) {
         // Check for overflow
-        if (unsignedLongDiv(-1 - value(i), radix) < v) {
+        if (java.lang.Long.divideUnsigned(-1 - value(i), radix) < v) {
           return -1
         }
       }
@@ -133,15 +113,18 @@ object NumberConverter {
 
     // Copy the digits in the right side of the array
     val temp = new Array[Byte](64)
-    var i = 1
-    while (i <= n.length - first) {
-      temp(temp.length - i) = n(n.length - i)
-      i += 1
-    }
-    char2byte(fromBase, temp.length - n.length + first, temp)
+    var v: Long = -1
+    if ((n.length == 65 && negative) || n.length <= 64) {
+      var i = 1
+      while (i <= n.length - first) {
+        temp(temp.length - i) = n(n.length - i)
+        i += 1
+      }
+      char2byte(fromBase, temp.length - n.length + first, temp)
 
-    // Do the conversion by going through a 64 bit integer
-    var v = encode(fromBase, temp.length - n.length + first, temp)
+      // Do the conversion by going through a 64 bit integer
+      v = encode(fromBase, temp.length - n.length + first, temp)
+    }
     if (negative && toBase > 0) {
       if (v < 0) {
         v = -1
@@ -168,5 +151,40 @@ object NumberConverter {
       temp(resultStartPos) = '-'
     }
     UTF8String.fromBytes(java.util.Arrays.copyOfRange(temp, resultStartPos, temp.length))
+  }
+
+  def toBinary(l: Long): Array[Byte] = {
+    val result = new Array[Byte](8)
+    result(0) = (l >>> 56 & 0xFF).toByte
+    result(1) = (l >>> 48 & 0xFF).toByte
+    result(2) = (l >>> 40 & 0xFF).toByte
+    result(3) = (l >>> 32 & 0xFF).toByte
+    result(4) = (l >>> 24 & 0xFF).toByte
+    result(5) = (l >>> 16 & 0xFF).toByte
+    result(6) = (l >>> 8 & 0xFF).toByte
+    result(7) = (l & 0xFF).toByte
+    result
+  }
+
+  def toBinary(i: Int): Array[Byte] = {
+    val result = new Array[Byte](4)
+    result(0) = (i >>> 24 & 0xFF).toByte
+    result(1) = (i >>> 16 & 0xFF).toByte
+    result(2) = (i >>> 8 & 0xFF).toByte
+    result(3) = (i & 0xFF).toByte
+    result
+  }
+
+  def toBinary(s: Short): Array[Byte] = {
+    val result = new Array[Byte](2)
+    result(0) = (s >>> 8 & 0xFF).toByte
+    result(1) = (s & 0xFF).toByte
+    result
+  }
+
+  def toBinary(s: Byte): Array[Byte] = {
+    val result = new Array[Byte](1)
+    result(0) = s
+    result
   }
 }
